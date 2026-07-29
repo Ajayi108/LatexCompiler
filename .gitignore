@@ -1,0 +1,17 @@
+.gradle/
+build/
+out/
+*.class
+*.log
+*.aux
+*.synctex.gz
+*.toc
+*.fls
+*.fdb_latexmk
+.idea/
+.vscode/
+*.iml
+dist/
+installer/
+libs/*.jar
+

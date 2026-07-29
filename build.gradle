@@ -1,0 +1,36 @@
+plugins {
+    id 'application'
+}
+
+group = 'com.ajayi'
+version = '0.1.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+application {
+    mainClass = 'latexcompiler.App'
+}
+
+dependencies {
+    implementation 'org.apache.pdfbox:pdfbox:3.0.8'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.named('jar') {
+    archiveBaseName = 'LatexCompiler'
+    manifest {
+        attributes(
+            'Main-Class': application.mainClass.get(),
+            'Class-Path': configurations.runtimeClasspath.files.collect { it.name }.join(' '),
+            'Implementation-Title': 'LatexCompiler',
+            'Implementation-Version': project.version
+        )
+    }
+}
