@@ -13,14 +13,6 @@ import java.util.regex.Pattern;
 
 public final class LatexSyntaxHighlighter {
     private static final int HIGHLIGHT_DELAY_MS = 120;
-    private static final Color BACKGROUND = new Color(22, 27, 34);
-    private static final Color FOREGROUND = new Color(230, 237, 243);
-    private static final Color COMMENT = new Color(139, 148, 158);
-    private static final Color COMMAND = new Color(255, 123, 114);
-    private static final Color KEY_COMMAND = new Color(210, 168, 255);
-    private static final Color ENVIRONMENT = new Color(255, 166, 87);
-    private static final Color MATH = new Color(121, 192, 255);
-    private static final Color BRACKET = new Color(126, 231, 135);
 
     private static final Pattern COMMENT_PATTERN = Pattern.compile("(?m)(?<!\\\\)%.*$");
     private static final Pattern COMMAND_PATTERN = Pattern.compile("\\\\(?:[a-zA-Z@]+\\*?|.)");
@@ -34,34 +26,23 @@ public final class LatexSyntaxHighlighter {
     private final JTextPane editor;
     private final StyledDocument document;
     private final Timer timer;
-    private final SimpleAttributeSet baseStyle;
-    private final SimpleAttributeSet commentStyle;
-    private final SimpleAttributeSet commandStyle;
-    private final SimpleAttributeSet keyCommandStyle;
-    private final SimpleAttributeSet environmentStyle;
-    private final SimpleAttributeSet mathStyle;
-    private final SimpleAttributeSet bracketStyle;
+    private SimpleAttributeSet baseStyle;
+    private SimpleAttributeSet commentStyle;
+    private SimpleAttributeSet commandStyle;
+    private SimpleAttributeSet keyCommandStyle;
+    private SimpleAttributeSet environmentStyle;
+    private SimpleAttributeSet mathStyle;
+    private SimpleAttributeSet bracketStyle;
 
     private boolean highlighting;
 
-    public LatexSyntaxHighlighter(JTextPane editor) {
+    public LatexSyntaxHighlighter(JTextPane editor, UiTheme theme) {
         this.editor = editor;
         this.document = editor.getStyledDocument();
-        this.baseStyle = style(FOREGROUND, false, false);
-        this.commentStyle = style(COMMENT, false, true);
-        this.commandStyle = style(COMMAND, false, false);
-        this.keyCommandStyle = style(KEY_COMMAND, true, false);
-        this.environmentStyle = style(ENVIRONMENT, true, false);
-        this.mathStyle = style(MATH, false, false);
-        this.bracketStyle = style(BRACKET, false, false);
         this.timer = new Timer(HIGHLIGHT_DELAY_MS, event -> refreshNow());
         this.timer.setRepeats(false);
 
-        editor.setBackground(BACKGROUND);
-        editor.setForeground(FOREGROUND);
-        editor.setCaretColor(FOREGROUND);
-        editor.setSelectionColor(new Color(56, 139, 253, 100));
-        editor.setSelectedTextColor(Color.WHITE);
+        applyTheme(theme);
     }
 
     public void schedule() {
@@ -92,6 +73,23 @@ public final class LatexSyntaxHighlighter {
         return highlighting;
     }
 
+    public void applyTheme(UiTheme theme) {
+        baseStyle = style(theme.editorForeground(), false, false);
+        commentStyle = style(theme.syntaxComment(), false, true);
+        commandStyle = style(theme.syntaxCommand(), false, false);
+        keyCommandStyle = style(theme.syntaxKeyCommand(), true, false);
+        environmentStyle = style(theme.syntaxEnvironment(), true, false);
+        mathStyle = style(theme.syntaxMath(), false, false);
+        bracketStyle = style(theme.syntaxBracket(), false, false);
+
+        editor.setBackground(theme.editorBackground());
+        editor.setForeground(theme.editorForeground());
+        editor.setCaretColor(theme.editorCaret());
+        editor.setSelectionColor(theme.editorSelection());
+        editor.setSelectedTextColor(theme.editorSelectedText());
+        refreshNow();
+    }
+
     private void applyPattern(String text, Pattern pattern, SimpleAttributeSet style) {
         Matcher matcher = pattern.matcher(text);
         while (matcher.find()) {
@@ -116,4 +114,3 @@ public final class LatexSyntaxHighlighter {
         return attributes;
     }
 }
-

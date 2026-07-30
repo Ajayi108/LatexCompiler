@@ -17,7 +17,7 @@ import java.util.Properties;
 import java.util.zip.GZIPInputStream;
 
 public final class SyncTexService {
-    public static final String METADATA_EXTENSION = ".latexcompiler-sync.properties";
+    public static final String METADATA_EXTENSION = ".latex-compiler-sync.properties";
 
     public Optional<SourcePosition> findSourcePosition(
         Path pdfFile,

@@ -6,7 +6,8 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 
 public final class AppPaths {
-    private static final String APP_NAME = "LatexCompiler";
+    private static final String APP_NAME = "LaTeX Compiler";
+    private static final String APP_SLUG = "latex-compiler";
 
     private AppPaths() {
     }
@@ -17,11 +18,15 @@ public final class AppPaths {
             return Paths.get(appData, APP_NAME);
         }
 
-        return Paths.get(System.getProperty("user.home"), "." + APP_NAME.toLowerCase());
+        return Paths.get(System.getProperty("user.home"), "." + APP_SLUG);
     }
 
     public static Path managedToolsDirectory() {
         return appDataDirectory().resolve("tools");
+    }
+
+    public static Path templatesDirectory() {
+        return appDataDirectory().resolve("templates");
     }
 
     public static Path bundledToolsDirectory() {

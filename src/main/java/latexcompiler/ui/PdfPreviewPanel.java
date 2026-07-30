@@ -3,6 +3,7 @@ package latexcompiler.ui;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JComponent;
+import javax.swing.JComboBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollBar;
@@ -39,13 +40,14 @@ import java.util.List;
 
 public final class PdfPreviewPanel extends JPanel {
     private static final float DISPLAY_DPI = 120f;
-    private static final float MIN_RENDER_DPI = 220f;
-    private static final float MAX_RENDER_DPI = 320f;
+    private static final float MIN_RENDER_DPI = 240f;
+    private static final float MAX_RENDER_DPI = 420f;
     private static final float MIN_ZOOM = 0.40f;
     private static final float MAX_ZOOM = 3.00f;
-    private static final float ZOOM_STEP = 0.10f;
-    private static final int SCROLL_UNIT_INCREMENT = 42;
-    private static final int ZOOM_RENDER_DELAY_MS = 180;
+    private static final float ZOOM_STEP = 0.15f;
+    private static final int SCROLL_UNIT_INCREMENT = 34;
+    private static final int WHEEL_SCROLL_PIXELS = 58;
+    private static final int ZOOM_RENDER_DELAY_MS = 90;
 
     private final DocumentCanvas documentCanvas;
     private final JLabel statusLabel;
@@ -53,13 +55,21 @@ public final class PdfPreviewPanel extends JPanel {
     private final JButton nextButton;
     private final JButton zoomOutButton;
     private final JButton zoomInButton;
+    private final JButton fitWidthButton;
+    private final JButton fitPageButton;
+    private final JComboBox<String> zoomCombo;
     private final Timer renderDebounceTimer;
+    private UiTheme theme = UiTheme.light();
+    private JPanel toolbarPanel;
+    private JPanel navigationPanel;
+    private JPanel zoomControlsPanel;
     private JScrollPane scrollPane;
 
     private Path currentPdf;
     private int pageCount;
     private float zoom;
     private int renderRequestId;
+    private boolean updatingZoomCombo;
     private SourceNavigationHandler sourceNavigationHandler;
     private SwingWorker<RenderedDocument, Void> renderWorker;
 
@@ -71,6 +81,9 @@ public final class PdfPreviewPanel extends JPanel {
         this.nextButton = new JButton("Next");
         this.zoomOutButton = new JButton("-");
         this.zoomInButton = new JButton("+");
+        this.fitWidthButton = new JButton("Fit Width");
+        this.fitPageButton = new JButton("Fit Page");
+        this.zoomCombo = new JComboBox<>(new String[] {"50%", "75%", "100%", "125%", "150%", "200%"});
         this.zoom = 1.0f;
         this.renderDebounceTimer = new Timer(ZOOM_RENDER_DELAY_MS, event -> renderDocument(false));
         this.renderDebounceTimer.setRepeats(false);
@@ -78,8 +91,41 @@ public final class PdfPreviewPanel extends JPanel {
         setBorder(BorderFactory.createTitledBorder("PDF Preview"));
         add(createToolbar(), BorderLayout.NORTH);
         add(createScrollPane(), BorderLayout.CENTER);
+        applyTheme(theme);
         installSourceNavigation();
         updateControls();
+    }
+
+    public void applyTheme(UiTheme theme) {
+        this.theme = theme;
+        setBackground(theme.panelBackground());
+        setForeground(theme.text());
+        setBorder(BorderFactory.createTitledBorder(
+            BorderFactory.createLineBorder(theme.border()),
+            "PDF Preview",
+            javax.swing.border.TitledBorder.LEADING,
+            javax.swing.border.TitledBorder.TOP,
+            getFont(),
+            theme.text()
+        ));
+
+        styleToolbarPanel(toolbarPanel, theme);
+        styleToolbarPanel(navigationPanel, theme);
+        styleToolbarPanel(zoomControlsPanel, theme);
+        statusLabel.setForeground(theme.text());
+        styleButton(previousButton, theme);
+        styleButton(nextButton, theme);
+        styleButton(zoomOutButton, theme);
+        styleButton(zoomInButton, theme);
+        styleButton(fitWidthButton, theme);
+        styleButton(fitPageButton, theme);
+        styleCombo(zoomCombo);
+        documentCanvas.applyTheme(theme);
+        if (scrollPane != null) {
+            scrollPane.setBorder(BorderFactory.createLineBorder(theme.border()));
+            scrollPane.getViewport().setBackground(theme.pdfBackground());
+        }
+        repaint();
     }
 
     public void setSourceNavigationHandler(SourceNavigationHandler sourceNavigationHandler) {
@@ -108,28 +154,56 @@ public final class PdfPreviewPanel extends JPanel {
     }
 
     private JPanel createToolbar() {
-        JPanel panel = new JPanel(new BorderLayout());
+        toolbarPanel = new JPanel(new BorderLayout());
 
-        JPanel navigation = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 3));
+        navigationPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 3));
         previousButton.addActionListener(event -> scrollToAdjacentPage(-1));
         nextButton.addActionListener(event -> scrollToAdjacentPage(1));
-        navigation.add(previousButton);
-        navigation.add(nextButton);
-        navigation.add(statusLabel);
+        navigationPanel.add(previousButton);
+        navigationPanel.add(nextButton);
+        navigationPanel.add(statusLabel);
 
-        JPanel zoomControls = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 3));
+        zoomControlsPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 3));
         zoomOutButton.setPreferredSize(new Dimension(44, 28));
         zoomInButton.setPreferredSize(new Dimension(44, 28));
         zoomOutButton.setToolTipText("Zoom out");
         zoomInButton.setToolTipText("Zoom in");
+        fitWidthButton.setToolTipText("Fit the PDF page width to the preview");
+        fitPageButton.setToolTipText("Fit the whole PDF page in the preview");
+        zoomCombo.setEditable(true);
+        zoomCombo.setPrototypeDisplayValue("100%");
+        zoomCombo.setPreferredSize(new Dimension(76, 28));
+        zoomCombo.setToolTipText("PDF zoom percentage");
         zoomOutButton.addActionListener(event -> changeZoom(-ZOOM_STEP, null));
         zoomInButton.addActionListener(event -> changeZoom(ZOOM_STEP, null));
-        zoomControls.add(zoomOutButton);
-        zoomControls.add(zoomInButton);
+        fitWidthButton.addActionListener(event -> fitWidth());
+        fitPageButton.addActionListener(event -> fitPage());
+        zoomCombo.addActionListener(event -> applyZoomComboSelection());
+        zoomControlsPanel.add(zoomOutButton);
+        zoomControlsPanel.add(zoomCombo);
+        zoomControlsPanel.add(zoomInButton);
+        zoomControlsPanel.add(fitWidthButton);
+        zoomControlsPanel.add(fitPageButton);
 
-        panel.add(navigation, BorderLayout.WEST);
-        panel.add(zoomControls, BorderLayout.EAST);
-        return panel;
+        toolbarPanel.add(navigationPanel, BorderLayout.WEST);
+        toolbarPanel.add(zoomControlsPanel, BorderLayout.EAST);
+        return toolbarPanel;
+    }
+
+    private void styleToolbarPanel(JPanel panel, UiTheme theme) {
+        if (panel != null) {
+            panel.setBackground(theme.panelBackground());
+            panel.setForeground(theme.text());
+        }
+    }
+
+    private void styleButton(JButton button, UiTheme theme) {
+        UiButtons.style(button, theme, new java.awt.Insets(4, 10, 4, 10));
+    }
+
+    private void styleCombo(JComboBox<?> comboBox) {
+        comboBox.setBackground(theme.raisedBackground());
+        comboBox.setForeground(theme.text());
     }
 
     private JScrollPane createScrollPane() {
@@ -195,12 +269,16 @@ public final class PdfPreviewPanel extends JPanel {
     }
 
     private void changeZoom(float amount, Point anchorPoint) {
+        setZoom(zoom + amount, anchorPoint);
+    }
+
+    private void setZoom(float requestedZoom, Point anchorPoint) {
         if (currentPdf == null) {
             return;
         }
 
         float oldZoom = zoom;
-        float newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom + amount));
+        float newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, requestedZoom));
         if (Float.compare(oldZoom, newZoom) == 0) {
             return;
         }
@@ -218,6 +296,56 @@ public final class PdfPreviewPanel extends JPanel {
             renderDocument(true);
         }
         updateControls();
+    }
+
+    private void fitWidth() {
+        fitToViewport(true, false);
+    }
+
+    private void fitPage() {
+        fitToViewport(true, true);
+    }
+
+    private void fitToViewport(boolean fitWidth, boolean fitHeight) {
+        if (scrollPane == null || currentPdf == null || !documentCanvas.hasPages()) {
+            return;
+        }
+
+        int pageIndex = documentCanvas.pageAtY(scrollPane.getViewport().getViewPosition().y);
+        Dimension rawPage = documentCanvas.rawPageSize(pageIndex);
+        if (rawPage.width <= 0 || rawPage.height <= 0) {
+            return;
+        }
+
+        JViewport viewport = scrollPane.getViewport();
+        double widthZoom = (Math.max(120, viewport.getWidth() - 64) * documentCanvas.renderDpi())
+            / (DISPLAY_DPI * rawPage.width);
+        double heightZoom = (Math.max(120, viewport.getHeight() - 64) * documentCanvas.renderDpi())
+            / (DISPLAY_DPI * rawPage.height);
+        double target = fitHeight ? Math.min(widthZoom, heightZoom) : widthZoom;
+        setZoom((float) target, new Point(
+            viewport.getViewPosition().x + viewport.getWidth() / 2,
+            viewport.getViewPosition().y + viewport.getHeight() / 2
+        ));
+    }
+
+    private void applyZoomComboSelection() {
+        if (updatingZoomCombo || currentPdf == null) {
+            return;
+        }
+
+        Object selected = zoomCombo.getSelectedItem();
+        if (selected == null) {
+            return;
+        }
+
+        String text = selected.toString().trim().replace("%", "");
+        try {
+            float requestedZoom = Float.parseFloat(text) / 100f;
+            setZoom(requestedZoom, null);
+        } catch (NumberFormatException ignored) {
+            updateZoomCombo();
+        }
     }
 
     private void renderDocument(boolean showMessage) {
@@ -341,9 +469,7 @@ public final class PdfPreviewPanel extends JPanel {
         JScrollBar scrollBar = event.isShiftDown()
             ? scrollPane.getHorizontalScrollBar()
             : scrollPane.getVerticalScrollBar();
-        int amount = (int) Math.round(event.getPreciseWheelRotation()
-            * Math.max(1, event.getScrollAmount())
-            * Math.max(SCROLL_UNIT_INCREMENT, scrollBar.getUnitIncrement()));
+        int amount = (int) Math.round(event.getPreciseWheelRotation() * WHEEL_SCROLL_PIXELS);
         if (amount == 0) {
             amount = event.getWheelRotation() < 0 ? -SCROLL_UNIT_INCREMENT : SCROLL_UNIT_INCREMENT;
         }
@@ -397,9 +523,22 @@ public final class PdfPreviewPanel extends JPanel {
         nextButton.setEnabled(hasPdf && visiblePage < pageCount - 1);
         zoomOutButton.setEnabled(hasPdf && zoom > MIN_ZOOM);
         zoomInButton.setEnabled(hasPdf && zoom < MAX_ZOOM);
+        fitWidthButton.setEnabled(hasPdf);
+        fitPageButton.setEnabled(hasPdf);
+        zoomCombo.setEnabled(hasPdf);
+        updateZoomCombo();
 
         if (hasPdf) {
             statusLabel.setText("Page " + (visiblePage + 1) + " of " + pageCount + "  Zoom " + Math.round(zoom * 100) + "%");
+        }
+    }
+
+    private void updateZoomCombo() {
+        updatingZoomCombo = true;
+        try {
+            zoomCombo.setSelectedItem(Math.round(zoom * 100) + "%");
+        } finally {
+            updatingZoomCombo = false;
         }
     }
 
@@ -421,6 +560,7 @@ public final class PdfPreviewPanel extends JPanel {
         private static final int PAGE_GAP = 18;
 
         private List<BufferedImage> pages = List.of();
+        private UiTheme theme = UiTheme.light();
         private float zoom = 1.0f;
         private float renderDpi = MIN_RENDER_DPI;
         private String message = "Compile a document to preview the PDF here.";
@@ -429,6 +569,13 @@ public final class PdfPreviewPanel extends JPanel {
             setOpaque(true);
             setBackground(new Color(238, 238, 238));
             setFont(previewFont());
+        }
+
+        private void applyTheme(UiTheme theme) {
+            this.theme = theme;
+            setBackground(theme.pdfBackground());
+            setForeground(theme.messageText());
+            repaint();
         }
 
         private void setDocument(List<BufferedImage> pages, float zoom, float renderDpi) {
@@ -448,6 +595,19 @@ public final class PdfPreviewPanel extends JPanel {
 
         private boolean hasPages() {
             return !pages.isEmpty();
+        }
+
+        private float renderDpi() {
+            return renderDpi;
+        }
+
+        private Dimension rawPageSize(int pageIndex) {
+            if (pages.isEmpty()) {
+                return new Dimension(0, 0);
+            }
+
+            BufferedImage page = pages.get(Math.max(0, Math.min(pageIndex, pages.size() - 1)));
+            return new Dimension(page.getWidth(), page.getHeight());
         }
 
         private void showMessage(String message) {
@@ -515,7 +675,7 @@ public final class PdfPreviewPanel extends JPanel {
         }
 
         private void paintPage(Graphics2D graphics, BufferedImage image, int x, int y, Dimension page) {
-            graphics.setColor(new Color(0, 0, 0, 34));
+            graphics.setColor(theme.pageShadow());
             graphics.fillRect(x + 4, y + 5, page.width, page.height);
             graphics.setColor(Color.WHITE);
             graphics.fillRect(x, y, page.width, page.height);
@@ -581,7 +741,7 @@ public final class PdfPreviewPanel extends JPanel {
                 return;
             }
 
-            graphics.setColor(new Color(95, 95, 95));
+            graphics.setColor(theme.messageText());
             graphics.setFont(getFont());
             FontMetrics metrics = graphics.getFontMetrics();
             int x = Math.max(16, (getWidth() - metrics.stringWidth(message)) / 2);
