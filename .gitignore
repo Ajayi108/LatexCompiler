@@ -1,17 +1,43 @@
-.gradle/
-build/
-out/
+# Java / Gradle build output
+/.gradle/
+/build/
+/out/
 *.class
-*.log
+
+# Packaged app output
+/dist/
+/installer/
+*.msi
+*.wixobj
+*.wixpdb
+*.cab
+
+# Downloaded local dependencies
+/libs/*.jar
+
+# LaTeX build artifacts
 *.aux
+*.bbl
+*.bcf
+*.blg
+*.dvi
+*.fdb_latexmk
+*.fls
+*.lof
+*.log
+*.lot
+*.nav
+*.out
+*.run.xml
+*.snm
 *.synctex.gz
 *.toc
-*.fls
-*.fdb_latexmk
-.idea/
-.vscode/
-*.iml
-dist/
-installer/
-libs/*.jar
+*.vrb
+*.xdv
 
+# IDE / OS files
+/.idea/
+/.vscode/
+*.iml
+.DS_Store
+Thumbs.db

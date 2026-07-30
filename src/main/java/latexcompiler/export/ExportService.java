@@ -19,7 +19,7 @@ import java.util.function.Consumer;
 
 public final class ExportService {
     private static final String TECTONIC_PDFTEX_COMPATIBILITY = """
-        % LatexCompiler compatibility layer for Tectonic's XeTeX engine.
+        % LaTeX Compiler compatibility layer for Tectonic's XeTeX engine.
         \\ifx\\pdfglyphtounicode\\undefined
           \\def\\pdfglyphtounicode#1#2{}%
         \\fi
@@ -57,7 +57,7 @@ public final class ExportService {
 
         // Tectonic writes several build artifacts, so compile in a temp folder and copy out the PDF.
         Path sourceDirectory = sourceFile.toAbsolutePath().getParent();
-        Path workDir = Files.createTempDirectory("latexcompiler-pdf-");
+        Path workDir = Files.createTempDirectory("latex-compiler-pdf-");
         PreparedSource preparedSource = prepareTectonicSource(sourceFile, workDir, logger);
         Path compileSource = preparedSource.compileSource();
         List<String> command = new ArrayList<>();
@@ -131,7 +131,7 @@ public final class ExportService {
         properties.setProperty("lineOffset", Integer.toString(preparedSource.lineOffset()));
 
         try (var writer = Files.newBufferedWriter(targetMetadata, StandardCharsets.UTF_8)) {
-            properties.store(writer, "LatexCompiler SyncTeX source mapping");
+            properties.store(writer, "LaTeX Compiler SyncTeX source mapping");
         }
     }
 

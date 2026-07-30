@@ -49,13 +49,13 @@ $manifest = @(
     "Manifest-Version: 1.0",
     "Main-Class: latexcompiler.App",
     "Class-Path: $(($dependencyJars | ForEach-Object { $_.Name }) -join ' ')",
-    "Implementation-Title: LatexCompiler",
+    "Implementation-Title: LaTeX Compiler",
     "Implementation-Version: $Version",
     ""
 )
 $manifest | Set-Content -Encoding ASCII $manifestPath
 
-$jarPath = "$libsDir/LatexCompiler-$Version.jar"
+$jarPath = "$libsDir/LaTeX-Compiler-$Version.jar"
 jar --create --file $jarPath --manifest $manifestPath -C $classesDir .
 if ($LASTEXITCODE -ne 0) {
     throw "jar failed with exit code $LASTEXITCODE."

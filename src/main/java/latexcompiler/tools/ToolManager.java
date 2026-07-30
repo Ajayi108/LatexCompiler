@@ -86,7 +86,7 @@ public final class ToolManager {
         AtomicInteger choice = new AtomicInteger(JOptionPane.CANCEL_OPTION);
         Runnable dialog = () -> choice.set(JOptionPane.showConfirmDialog(
             owner,
-            toolType.displayName() + " is required for this export.\n\nDownload and install it inside LatexCompiler now?",
+            toolType.displayName() + " is required for this export.\n\nDownload and install it inside LaTeX Compiler now?",
             "Install " + toolType.displayName(),
             JOptionPane.YES_NO_OPTION,
             JOptionPane.QUESTION_MESSAGE

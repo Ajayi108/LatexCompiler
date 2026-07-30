@@ -26,6 +26,8 @@ public final class LineNumberView extends JComponent implements DocumentListener
     private static final int HORIZONTAL_PADDING = 10;
 
     private final JTextComponent editor;
+    private Color currentLineBackground;
+    private Color currentLineForeground;
     private int currentLine;
 
     public LineNumberView(JTextComponent editor) {
@@ -34,8 +36,15 @@ public final class LineNumberView extends JComponent implements DocumentListener
         this.editor.getDocument().addDocumentListener(this);
         this.editor.addCaretListener(this);
         setFont(gutterFont(editor));
-        setForeground(new Color(125, 133, 144));
-        setBackground(new Color(13, 17, 23));
+        applyTheme(UiTheme.dark());
+    }
+
+    public void applyTheme(UiTheme theme) {
+        setForeground(theme.gutterForeground());
+        setBackground(theme.gutterBackground());
+        currentLineBackground = theme.gutterCurrentLine();
+        currentLineForeground = theme.gutterCurrentText();
+        repaint();
     }
 
     @Override
@@ -87,7 +96,7 @@ public final class LineNumberView extends JComponent implements DocumentListener
             }
 
             if (line == currentLine) {
-                graphics.setColor(new Color(33, 38, 45));
+                graphics.setColor(currentLineBackground);
                 graphics.fillRect(0, (int) lineBounds.getY(), getWidth(), (int) Math.ceil(lineBounds.getHeight()));
             }
 
@@ -96,7 +105,7 @@ public final class LineNumberView extends JComponent implements DocumentListener
             int y = (int) Math.round(lineBounds.getY()
                 + (lineBounds.getHeight() - metrics.getHeight()) / 2.0
                 + metrics.getAscent());
-            graphics.setColor(line == currentLine ? new Color(230, 237, 243) : getForeground());
+            graphics.setColor(line == currentLine ? currentLineForeground : getForeground());
             graphics.drawString(number, x, y);
         } catch (BadLocationException ignored) {
             // The editor can change during painting; the next repaint will correct the gutter.

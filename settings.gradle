@@ -12,5 +12,4 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = 'LatexCompiler'
-
+rootProject.name = 'latex-compiler'
