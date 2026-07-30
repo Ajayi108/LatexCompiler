@@ -32,7 +32,7 @@ public final class ToolDownloader {
         logger.accept("Downloading " + fileName + "...");
         HttpRequest request = HttpRequest.newBuilder(uri)
             .timeout(Duration.ofMinutes(10))
-            .header("User-Agent", "LatexCompiler")
+            .header("User-Agent", "LaTeX-Compiler")
             .GET()
             .build();
 

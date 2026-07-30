@@ -29,7 +29,7 @@ public final class GithubReleaseClient {
         HttpRequest request = HttpRequest.newBuilder(uri)
             .timeout(Duration.ofSeconds(60))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "LatexCompiler")
+            .header("User-Agent", "LaTeX-Compiler")
             .GET()
             .build();
 

@@ -1,20 +1,37 @@
-# LatexCompiler
+# LaTeX Compiler
 
 A local desktop LaTeX editor and exporter for Windows first, with a path to macOS and Linux later.
 
 The app is designed so end users install only the app. It can use bundled tools or prompt the user to download required tools into the app-managed data folder.
 
+## Preview
+
+![LaTeX Compiler editor with project files, source code, outline, logs, and PDF preview](docs/images/app-preview.png)
+
 ## Current Features
 
 - Create, open, edit, and save `.tex` files
+- Start new documents from a richer LaTeX example with sections, math, tables, and charts
 - Edit LaTeX with syntax colors and line numbers
+- Insert, copy, and PDF-preview built-in templates for tables, graphs, equations, figures, and resume sections
+- Save selected LaTeX as reusable custom templates stored in the app data folder
 - Export to PDF with Tectonic
 - Preview the compiled PDF inside the app
+- Browse project files in a VS Code-style expandable tree
+- Drag and drop files or folders in the tree to move them into different folders
+- Keep the file panel scoped to the opened project folder, like a local workspace
+- Navigate headings from a file outline below the project tree
+- Create, rename, move, copy, and delete project files from the file panel
+- Select a main `.tex` file for multi-file projects
+- Find and replace source text with `Ctrl+F` and `Ctrl+H`
+- Click LaTeX log line references to jump back to the editor
+- Auto-refresh the file panel when project files change outside the app
+- Switch between system, light, and dark mode from the View menu
 - Show or hide export logs
 - Export to Word `.docx` with Pandoc
-- Export to PowerPoint `.pptx` with Pandoc
 - Shows export logs inside the app
 - Prompts before downloading missing command-line tools
+- Shows Java, Tectonic, Pandoc, project, and compile settings inside the app
 - Opens generated exports with the system viewer
 
 ## Tool Strategy
@@ -96,8 +113,6 @@ The generated `.exe` installer is uploaded to the GitHub Release.
 
 ## Roadmap
 
+- PowerPoint export for slide-friendly LaTeX documents
 - Google Drive sync with user-approved OAuth
-- Project folder support for images, `.bib`, style files, and templates
-- Better LaTeX diagnostics with clickable error lines
-- Built-in PDF preview
 - macOS and Linux packaging

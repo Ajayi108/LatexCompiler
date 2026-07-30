@@ -13,6 +13,7 @@ java {
 
 application {
     mainClass = 'latexcompiler.App'
+    applicationName = 'LaTeX-Compiler'
 }
 
 dependencies {
@@ -24,12 +25,12 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 tasks.named('jar') {
-    archiveBaseName = 'LatexCompiler'
+    archiveBaseName = 'LaTeX-Compiler'
     manifest {
         attributes(
             'Main-Class': application.mainClass.get(),
             'Class-Path': configurations.runtimeClasspath.files.collect { it.name }.join(' '),
-            'Implementation-Title': 'LatexCompiler',
+            'Implementation-Title': 'LaTeX Compiler',
             'Implementation-Version': project.version
         )
     }

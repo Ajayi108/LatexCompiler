@@ -5,18 +5,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 . "$PSScriptRoot/use-java.ps1"
+. "$PSScriptRoot/ensure-wix.ps1"
 
 if (-not (Get-Command jpackage -ErrorAction SilentlyContinue)) {
     throw "jpackage was not found. Install JDK 21 or newer and make sure it is on PATH."
 }
 
-if (-not (Get-Command candle.exe -ErrorAction SilentlyContinue) -and -not (Get-Command wix.exe -ErrorAction SilentlyContinue)) {
-    Write-Warning "WiX was not found on PATH. jpackage may require WiX to create a Windows .exe installer."
-}
-
-$appImagePath = "build/install/LatexCompiler"
+$displayName = "LaTeX Compiler"
+$artifactName = "LaTeX-Compiler"
+$appImagePath = "build/install/$artifactName"
 if (Get-Command gradle -ErrorAction SilentlyContinue) {
-    gradle clean installDist
+    # Avoid `clean` here because the portable JDK/WiX cache also lives under build\tools.
+    gradle installDist
     $appImage = Resolve-Path $appImagePath
 } else {
     $jarPath = & "$PSScriptRoot/build-jar.ps1" -Version $Version
@@ -33,9 +33,9 @@ if (Test-Path $toolsPath) {
     Copy-Item -Recurse -Force $toolsPath "$appImage/tools"
 }
 
-$mainJar = Get-ChildItem "$appImage/lib/LatexCompiler-*.jar" | Select-Object -First 1
+$mainJar = Get-ChildItem "$appImage/lib/$artifactName-*.jar" | Select-Object -First 1
 if ($null -eq $mainJar) {
-    throw "Could not find the LatexCompiler jar in $appImage/lib."
+    throw "Could not find the $artifactName jar in $appImage/lib."
 }
 
 $outputDir = "installer"
@@ -43,7 +43,7 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
 jpackage `
     --type exe `
-    --name LatexCompiler `
+    --name $displayName `
     --app-version $Version `
     --input "$appImage" `
     --main-jar "lib/$($mainJar.Name)" `
@@ -55,6 +55,12 @@ jpackage `
 
 if ($LASTEXITCODE -ne 0) {
     throw "jpackage failed with exit code $LASTEXITCODE."
+}
+
+$spacedInstaller = Join-Path $outputDir "$displayName-$Version.exe"
+$safeInstaller = Join-Path $outputDir "$artifactName-$Version.exe"
+if ((Test-Path $spacedInstaller) -and ($spacedInstaller -ne $safeInstaller)) {
+    Move-Item -Force $spacedInstaller $safeInstaller
 }
 
 Write-Host "Installer written to $outputDir"
