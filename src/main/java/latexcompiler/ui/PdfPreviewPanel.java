@@ -16,6 +16,14 @@ import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
 import javax.swing.Timer;
 import javax.swing.UIManager;
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.rendering.ImageType;
+import org.apache.pdfbox.rendering.PDFRenderer;
+import org.apache.pdfbox.text.PDFTextStripper;
+import org.apache.pdfbox.text.PDFTextStripperByArea;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Cursor;
@@ -34,12 +42,12 @@ import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.event.MouseMotionAdapter;
 import java.awt.event.MouseWheelEvent;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
+import java.awt.geom.Rectangle2D;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -82,6 +90,7 @@ public final class PdfPreviewPanel extends JPanel {
     private SourceNavigationHandler sourceNavigationHandler;
     private SwingWorker<RenderedDocument, Void> renderWorker;
     private SwingWorker<String, Void> textCopyWorker;
+    private boolean suppressNextSourceClick;
 
     public PdfPreviewPanel() {
         super(new BorderLayout());
@@ -234,7 +243,7 @@ public final class PdfPreviewPanel extends JPanel {
         scrollPane.getHorizontalScrollBar().setUnitIncrement(SCROLL_UNIT_INCREMENT);
         scrollPane.getHorizontalScrollBar().setBlockIncrement(SCROLL_UNIT_INCREMENT * 6);
         scrollPane.setWheelScrollingEnabled(true);
-        scrollPane.setToolTipText("Click PDF text to jump to LaTeX. Right-click or Ctrl+C to copy page text. Use Ctrl + mouse wheel to zoom.");
+        scrollPane.setToolTipText("Drag to select PDF text. Ctrl+C copies the selection or visible page. Use Ctrl + mouse wheel to zoom.");
         scrollPane.addMouseWheelListener(this::handleMouseWheel);
         scrollPane.getViewport().addChangeListener(event -> updateControls());
         documentCanvas.addMouseWheelListener(this::handleMouseWheel);
@@ -243,23 +252,48 @@ public final class PdfPreviewPanel extends JPanel {
     }
 
     private void installSourceNavigation() {
-        documentCanvas.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        documentCanvas.setCursor(Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR));
         documentCanvas.addMouseListener(new MouseAdapter() {
             @Override
             public void mousePressed(MouseEvent event) {
                 documentCanvas.requestFocusInWindow();
                 showContextMenuIfNeeded(event);
+                if (event.getButton() == MouseEvent.BUTTON1 && documentCanvas.pageHitAt(event.getPoint()) != null) {
+                    suppressNextSourceClick = false;
+                    documentCanvas.beginSelection(event.getPoint());
+                } else if (event.getButton() == MouseEvent.BUTTON1) {
+                    documentCanvas.clearSelection();
+                }
             }
 
             @Override
             public void mouseReleased(MouseEvent event) {
                 showContextMenuIfNeeded(event);
+                if (event.getButton() == MouseEvent.BUTTON1 && documentCanvas.isSelecting()) {
+                    boolean selectedText = documentCanvas.finishSelection();
+                    suppressNextSourceClick = selectedText;
+                    if (selectedText) {
+                        statusLabel.setText("Selection ready. Press Ctrl+C to copy.");
+                    }
+                }
             }
 
             @Override
             public void mouseClicked(MouseEvent event) {
+                if (suppressNextSourceClick) {
+                    suppressNextSourceClick = false;
+                    return;
+                }
                 if (event.getButton() == MouseEvent.BUTTON1) {
                     navigateToSource(event.getPoint());
+                }
+            }
+        });
+        documentCanvas.addMouseMotionListener(new MouseMotionAdapter() {
+            @Override
+            public void mouseDragged(MouseEvent event) {
+                if (documentCanvas.isSelecting()) {
+                    documentCanvas.updateSelection(event.getPoint());
                 }
             }
         });
@@ -273,7 +307,7 @@ public final class PdfPreviewPanel extends JPanel {
         documentCanvas.getActionMap().put("copy-page-text", new AbstractAction() {
             @Override
             public void actionPerformed(java.awt.event.ActionEvent event) {
-                copyCurrentPageText();
+                copySelectionOrCurrentPageText();
             }
         });
 
@@ -295,14 +329,19 @@ public final class PdfPreviewPanel extends JPanel {
         }
 
         boolean hasPdf = currentPdf != null && pageCount > 0;
+        boolean hasSelection = documentCanvas.hasTextSelection();
+        JMenuItem copySelection = new JMenuItem("Copy Selection Text");
         JMenuItem copyPage = new JMenuItem("Copy Page Text");
         JMenuItem copyAll = new JMenuItem("Copy All Text");
+        copySelection.setEnabled(hasPdf && hasSelection && textCopyWorker == null);
         copyPage.setEnabled(hasPdf && textCopyWorker == null);
         copyAll.setEnabled(hasPdf && textCopyWorker == null);
+        copySelection.addActionListener(action -> copySelectedText());
         copyPage.addActionListener(action -> copyCurrentPageText());
         copyAll.addActionListener(action -> copyAllText());
 
         JPopupMenu menu = new JPopupMenu();
+        menu.add(copySelection);
         menu.add(copyPage);
         menu.add(copyAll);
         menu.show(event.getComponent(), event.getX(), event.getY());
@@ -350,6 +389,28 @@ public final class PdfPreviewPanel extends JPanel {
 
         int page = visiblePageIndex() + 1;
         copyPdfText(page, page, "page " + page);
+    }
+
+    private void copySelectionOrCurrentPageText() {
+        if (documentCanvas.hasTextSelection()) {
+            copySelectedText();
+        } else {
+            copyCurrentPageText();
+        }
+    }
+
+    private void copySelectedText() {
+        if (currentPdf == null || pageCount == 0 || !documentCanvas.hasTextSelection()) {
+            return;
+        }
+
+        List<PageSelection> selections = documentCanvas.pageSelections();
+        if (selections.isEmpty()) {
+            statusLabel.setText("No PDF text selected");
+            return;
+        }
+
+        copySelectedPdfText(selections);
     }
 
     private void copyAllText() {
@@ -405,31 +466,80 @@ public final class PdfPreviewPanel extends JPanel {
     }
 
     private String extractPdfText(Path pdfToCopy, int startPage, int endPage) throws Exception {
-        try {
-            Class<?> loaderClass = Class.forName("org.apache.pdfbox.Loader");
-            Class<?> documentClass = Class.forName("org.apache.pdfbox.pdmodel.PDDocument");
-            Class<?> stripperClass = Class.forName("org.apache.pdfbox.text.PDFTextStripper");
+        try (PDDocument document = Loader.loadPDF(new File(pdfToCopy.toString()))) {
+            PDFTextStripper stripper = new PDFTextStripper();
+            stripper.setSortByPosition(true);
+            stripper.setStartPage(startPage);
+            stripper.setEndPage(endPage);
+            return stripper.getText(document);
+        }
+    }
 
-            Object document = loaderClass
-                .getMethod("loadPDF", File.class)
-                .invoke(null, new File(pdfToCopy.toString()));
+    private void copySelectedPdfText(List<PageSelection> selections) {
+        if (currentPdf == null || textCopyWorker != null) {
+            return;
+        }
 
-            try {
-                Object stripper = stripperClass.getConstructor().newInstance();
-                stripperClass.getMethod("setStartPage", int.class).invoke(stripper, startPage);
-                stripperClass.getMethod("setEndPage", int.class).invoke(stripper, endPage);
-                return (String) stripperClass.getMethod("getText", documentClass).invoke(stripper, document);
-            } finally {
-                documentClass.getMethod("close").invoke(document);
+        Path pdfToCopy = currentPdf;
+        textCopyWorker = new SwingWorker<>() {
+            @Override
+            protected String doInBackground() throws Exception {
+                return extractSelectedPdfText(pdfToCopy, selections);
             }
-        } catch (ClassNotFoundException error) {
-            throw new IOException("PDFBox is missing from the app libraries.", error);
-        } catch (InvocationTargetException error) {
-            Throwable cause = error.getCause();
-            if (cause instanceof Exception exception) {
-                throw exception;
+
+            @Override
+            protected void done() {
+                String message = "Could not copy selected PDF text";
+                try {
+                    String text = get();
+                    if (text == null || text.isBlank()) {
+                        message = "No selectable text found in selection";
+                        return;
+                    }
+
+                    Toolkit.getDefaultToolkit()
+                        .getSystemClipboard()
+                        .setContents(new StringSelection(text), null);
+                    message = "Copied selected PDF text";
+                } catch (Exception error) {
+                    message = "Could not copy selected PDF text";
+                } finally {
+                    textCopyWorker = null;
+                    updateControls();
+                    statusLabel.setText(message);
+                }
             }
-            throw new IOException("PDF text extraction failed.", cause);
+        };
+
+        updateControls();
+        statusLabel.setText("Copying selected text...");
+        textCopyWorker.execute();
+    }
+
+    private String extractSelectedPdfText(Path pdfToCopy, List<PageSelection> selections) throws IOException {
+        try (PDDocument document = Loader.loadPDF(new File(pdfToCopy.toString()))) {
+            StringBuilder selectedText = new StringBuilder();
+            for (PageSelection selection : selections) {
+                if (selection.pageIndex() < 0 || selection.pageIndex() >= document.getNumberOfPages()) {
+                    continue;
+                }
+
+                PDPage page = document.getPage(selection.pageIndex());
+                PDFTextStripperByArea stripper = new PDFTextStripperByArea();
+                stripper.setSortByPosition(true);
+                stripper.addRegion("selection", selection.toPdfRectangle(page.getCropBox()));
+                stripper.extractRegions(page);
+                String text = stripper.getTextForRegion("selection").trim();
+                if (text.isBlank()) {
+                    continue;
+                }
+
+                if (selectedText.length() > 0) {
+                    selectedText.append(System.lineSeparator());
+                }
+                selectedText.append(text);
+            }
+            return selectedText.toString();
         }
     }
 
@@ -558,47 +668,22 @@ public final class PdfPreviewPanel extends JPanel {
         renderWorker.execute();
     }
 
-    @SuppressWarnings({"unchecked", "rawtypes"})
     private RenderedDocument renderPdfDocument(Path pdfToRender, float requestedZoom) throws Exception {
         float renderDpi = renderDpiForZoom(requestedZoom);
-        try {
-            Class<?> loaderClass = Class.forName("org.apache.pdfbox.Loader");
-            Class<?> documentClass = Class.forName("org.apache.pdfbox.pdmodel.PDDocument");
-            Class<?> rendererClass = Class.forName("org.apache.pdfbox.rendering.PDFRenderer");
-            Class<?> imageTypeClass = Class.forName("org.apache.pdfbox.rendering.ImageType");
-
-            Object document = loaderClass
-                .getMethod("loadPDF", File.class)
-                .invoke(null, new File(pdfToRender.toString()));
-
-            try {
-                int pages = (int) documentClass.getMethod("getNumberOfPages").invoke(document);
-                if (pages == 0) {
-                    throw new IOException("PDF has no pages.");
-                }
-
-                Object renderer = rendererClass.getConstructor(documentClass).newInstance(document);
-                Object rgb = Enum.valueOf((Class<Enum>) imageTypeClass.asSubclass(Enum.class), "RGB");
-                Method renderMethod = rendererClass.getMethod("renderImageWithDPI", int.class, float.class, imageTypeClass);
-                List<BufferedImage> renderedPages = new ArrayList<>(pages);
-
-                for (int page = 0; page < pages; page++) {
-                    BufferedImage image = (BufferedImage) renderMethod.invoke(renderer, page, renderDpi, rgb);
-                    renderedPages.add(image);
-                }
-
-                return new RenderedDocument(renderedPages, pages, renderDpi);
-            } finally {
-                documentClass.getMethod("close").invoke(document);
+        try (PDDocument document = Loader.loadPDF(new File(pdfToRender.toString()))) {
+            int pages = document.getNumberOfPages();
+            if (pages == 0) {
+                throw new IOException("PDF has no pages.");
             }
-        } catch (ClassNotFoundException error) {
-            throw new IOException("PDFBox is missing from the app libraries.", error);
-        } catch (InvocationTargetException error) {
-            Throwable cause = error.getCause();
-            if (cause instanceof Exception exception) {
-                throw exception;
+
+            PDFRenderer renderer = new PDFRenderer(document);
+            List<BufferedImage> renderedPages = new ArrayList<>(pages);
+            for (int page = 0; page < pages; page++) {
+                BufferedImage image = renderer.renderImageWithDPI(page, renderDpi, ImageType.RGB);
+                renderedPages.add(image);
             }
-            throw new IOException("PDF rendering failed.", cause);
+
+            return new RenderedDocument(renderedPages, pages, renderDpi);
         }
     }
 
@@ -729,15 +814,40 @@ public final class PdfPreviewPanel extends JPanel {
     private record PageHit(int pageIndex, double normalizedX, double normalizedY) {
     }
 
+    private record PageSelection(
+        int pageIndex,
+        double normalizedX,
+        double normalizedY,
+        double normalizedWidth,
+        double normalizedHeight
+    ) {
+        private Rectangle2D toPdfRectangle(PDRectangle pageBounds) {
+            double width = pageBounds.getWidth();
+            double height = pageBounds.getHeight();
+            return new Rectangle2D.Double(
+                normalizedX * width,
+                normalizedY * height,
+                Math.max(1d, normalizedWidth * width),
+                Math.max(1d, normalizedHeight * height)
+            );
+        }
+    }
+
     private static final class DocumentCanvas extends JComponent {
         private static final int PAGE_MARGIN = 24;
         private static final int PAGE_GAP = 18;
+        private static final int MIN_SELECTION_PIXELS = 4;
+        private static final Color SELECTION_FILL = new Color(0, 120, 215, 74);
+        private static final Color SELECTION_BORDER = new Color(0, 95, 180, 160);
 
         private List<BufferedImage> pages = List.of();
         private UiTheme theme = UiTheme.light();
         private float zoom = 1.0f;
         private float renderDpi = MIN_RENDER_DPI;
         private String message = "Compile a document to preview the PDF here.";
+        private Point selectionStart;
+        private Point selectionEnd;
+        private boolean selecting;
 
         private DocumentCanvas() {
             setOpaque(true);
@@ -758,12 +868,14 @@ public final class PdfPreviewPanel extends JPanel {
             this.zoom = zoom;
             this.renderDpi = renderDpi;
             this.message = null;
+            clearSelection();
             revalidate();
             repaint();
         }
 
         private void setZoom(float zoom) {
             this.zoom = zoom;
+            clearSelection();
             revalidate();
             repaint();
         }
@@ -793,8 +905,96 @@ public final class PdfPreviewPanel extends JPanel {
         private void clear(String message) {
             this.pages = List.of();
             this.message = message;
+            clearSelection();
             revalidate();
             repaint();
+        }
+
+        private void beginSelection(Point point) {
+            this.selectionStart = new Point(point);
+            this.selectionEnd = new Point(point);
+            this.selecting = true;
+            repaint();
+        }
+
+        private void updateSelection(Point point) {
+            if (!selecting || selectionStart == null) {
+                return;
+            }
+
+            this.selectionEnd = new Point(point);
+            repaint();
+        }
+
+        private boolean finishSelection() {
+            selecting = false;
+            if (!hasTextSelection()) {
+                clearSelection();
+                return false;
+            }
+
+            repaint();
+            return true;
+        }
+
+        private boolean isSelecting() {
+            return selecting;
+        }
+
+        private boolean hasTextSelection() {
+            Rectangle selection = selectionBounds();
+            return selection != null
+                && selection.width >= MIN_SELECTION_PIXELS
+                && selection.height >= MIN_SELECTION_PIXELS
+                && !pageSelections().isEmpty();
+        }
+
+        private void clearSelection() {
+            selectionStart = null;
+            selectionEnd = null;
+            selecting = false;
+            repaint();
+        }
+
+        private List<PageSelection> pageSelections() {
+            Rectangle selection = selectionBounds();
+            if (selection == null || pages.isEmpty()) {
+                return List.of();
+            }
+
+            List<PageSelection> selectedPages = new ArrayList<>();
+            int y = PAGE_MARGIN;
+            for (int pageIndex = 0; pageIndex < pages.size(); pageIndex++) {
+                Dimension page = displaySize(pages.get(pageIndex));
+                int x = Math.max(PAGE_MARGIN, (getWidth() - page.width) / 2);
+                Rectangle pageBounds = new Rectangle(x, y, page.width, page.height);
+                Rectangle selectedArea = selection.intersection(pageBounds);
+                if (selectedArea.width >= MIN_SELECTION_PIXELS && selectedArea.height >= MIN_SELECTION_PIXELS) {
+                    selectedPages.add(new PageSelection(
+                        pageIndex,
+                        (selectedArea.x - pageBounds.x) / (double) pageBounds.width,
+                        (selectedArea.y - pageBounds.y) / (double) pageBounds.height,
+                        selectedArea.width / (double) pageBounds.width,
+                        selectedArea.height / (double) pageBounds.height
+                    ));
+                }
+
+                y += page.height + PAGE_GAP;
+            }
+
+            return selectedPages;
+        }
+
+        private Rectangle selectionBounds() {
+            if (selectionStart == null || selectionEnd == null) {
+                return null;
+            }
+
+            int x = Math.min(selectionStart.x, selectionEnd.x);
+            int y = Math.min(selectionStart.y, selectionEnd.y);
+            int width = Math.abs(selectionStart.x - selectionEnd.x);
+            int height = Math.abs(selectionStart.y - selectionEnd.y);
+            return new Rectangle(x, y, width, height);
         }
 
         @Override
@@ -840,6 +1040,7 @@ public final class PdfPreviewPanel extends JPanel {
 
                     if (y + page.height >= clip.y && y <= clip.y + clip.height) {
                         paintPage(graphics2D, pageImage, x, y, page);
+                        paintSelection(graphics2D, new Rectangle(x, y, page.width, page.height));
                     }
 
                     y += page.height + PAGE_GAP;
@@ -855,6 +1056,23 @@ public final class PdfPreviewPanel extends JPanel {
             graphics.setColor(Color.WHITE);
             graphics.fillRect(x, y, page.width, page.height);
             graphics.drawImage(image, x, y, page.width, page.height, null);
+        }
+
+        private void paintSelection(Graphics2D graphics, Rectangle pageBounds) {
+            Rectangle selection = selectionBounds();
+            if (selection == null) {
+                return;
+            }
+
+            Rectangle selectedArea = selection.intersection(pageBounds);
+            if (selectedArea.width < MIN_SELECTION_PIXELS || selectedArea.height < MIN_SELECTION_PIXELS) {
+                return;
+            }
+
+            graphics.setColor(SELECTION_FILL);
+            graphics.fill(selectedArea);
+            graphics.setColor(SELECTION_BORDER);
+            graphics.draw(selectedArea);
         }
 
         private int pageTop(int pageIndex) {
