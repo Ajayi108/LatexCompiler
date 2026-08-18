@@ -46,6 +46,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "javac failed with exit code $LASTEXITCODE."
 }
 
+$resourcesDir = "src/main/resources"
+if (Test-Path $resourcesDir) {
+    Copy-Item -Recurse -Force "$resourcesDir/*" $classesDir
+}
+
 $manifest = @(
     "Manifest-Version: 1.0",
     "Main-Class: latexcompiler.App",
