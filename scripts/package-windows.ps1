@@ -41,17 +41,25 @@ if ($null -eq $mainJar) {
 $outputDir = "installer"
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
-jpackage `
-    --type exe `
-    --name $displayName `
-    --app-version $Version `
-    --input "$appImage" `
-    --main-jar "lib/$($mainJar.Name)" `
-    --main-class "latexcompiler.App" `
-    --dest $outputDir `
-    --vendor "Ajayi" `
-    --win-menu `
-    --win-shortcut
+$jpackageArgs = @(
+    "--type", "exe",
+    "--name", $displayName,
+    "--app-version", $Version,
+    "--input", "$appImage",
+    "--main-jar", "lib/$($mainJar.Name)",
+    "--main-class", "latexcompiler.App",
+    "--dest", $outputDir,
+    "--vendor", "Ajayi",
+    "--win-menu",
+    "--win-shortcut"
+)
+
+$iconPath = "assets/app-icon.ico"
+if (Test-Path $iconPath) {
+    $jpackageArgs += @("--icon", (Resolve-Path $iconPath).Path)
+}
+
+jpackage @jpackageArgs
 
 if ($LASTEXITCODE -ne 0) {
     throw "jpackage failed with exit code $LASTEXITCODE."

@@ -55,6 +55,7 @@ import javax.swing.SwingWorker;
 import javax.swing.Timer;
 import javax.swing.UIManager;
 import javax.swing.WindowConstants;
+import javax.imageio.ImageIO;
 import javax.swing.event.CaretEvent;
 import javax.swing.event.CaretListener;
 import javax.swing.event.ChangeListener;
@@ -81,6 +82,7 @@ import java.awt.Cursor;
 import java.awt.Desktop;
 import java.awt.Dimension;
 import java.awt.Font;
+import java.awt.Image;
 import java.awt.Insets;
 import java.awt.Point;
 import java.awt.Rectangle;
@@ -93,6 +95,7 @@ import java.awt.event.MouseEvent;
 import java.awt.event.MouseMotionAdapter;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -342,6 +345,7 @@ public final class MainWindow extends JFrame {
 
     public MainWindow() {
         super("LaTeX Compiler");
+        installWindowIcon();
         this.toolManager = new ToolManager(new GithubReleaseClient(), new ToolDownloader());
         this.exportService = new ExportService(this.toolManager, new ProcessRunner());
         this.syncTexService = new SyncTexService();
@@ -457,6 +461,21 @@ public final class MainWindow extends JFrame {
         loadStarterDocument();
         refreshProjectFiles();
         updateTitle();
+    }
+
+    private void installWindowIcon() {
+        try (InputStream iconStream = MainWindow.class.getResourceAsStream("/app-icon.png")) {
+            if (iconStream == null) {
+                return;
+            }
+
+            Image icon = ImageIO.read(iconStream);
+            if (icon != null) {
+                setIconImage(icon);
+            }
+        } catch (IOException ignored) {
+            // A missing icon should never prevent the editor from starting.
+        }
     }
 
     private JTextPane createEditor() {
