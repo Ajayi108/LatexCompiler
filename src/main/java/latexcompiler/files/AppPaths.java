@@ -29,6 +29,10 @@ public final class AppPaths {
         return appDataDirectory().resolve("templates");
     }
 
+    public static Path logsDirectory() {
+        return appDataDirectory().resolve("logs");
+    }
+
     public static Path bundledToolsDirectory() {
         Path applicationDirectory = applicationDirectory();
         Path direct = applicationDirectory.resolve("tools").resolve(Platform.current().folderName());
