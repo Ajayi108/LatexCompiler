@@ -18,6 +18,8 @@ import java.util.Properties;
 import java.util.function.Consumer;
 
 public final class ExportService {
+    // Some existing resume templates were written for pdfLaTeX commands. Tectonic uses
+    // XeTeX, so this prefix supplies no-op compatibility definitions before compiling.
     private static final String TECTONIC_PDFTEX_COMPATIBILITY = """
         % LaTeX Compiler compatibility layer for Tectonic's XeTeX engine.
         \\ifx\\pdfglyphtounicode\\undefined
@@ -79,10 +81,10 @@ public final class ExportService {
         if (result.exitCode() == 0 && Files.exists(generatedPdf)) {
             Files.copy(generatedPdf, targetFile, StandardCopyOption.REPLACE_EXISTING);
             copySyncTexArtifacts(sourceFile, targetFile, workDir.resolve(baseName + ".synctex.gz"), preparedSource, logger);
-            return new ExportResult(true, targetFile, result.output());
+            return new ExportResult(true, targetFile, result.output(), preparedSource.lineOffset());
         }
 
-        return new ExportResult(false, targetFile, result.output());
+        return new ExportResult(false, targetFile, result.output(), preparedSource.lineOffset());
     }
 
     private PreparedSource prepareTectonicSource(Path sourceFile, Path workDir, Consumer<String> logger) throws IOException {
@@ -113,6 +115,8 @@ public final class ExportService {
         Path targetSyncTex = SyncTexService.syncTexPathForPdf(targetFile);
         Path targetMetadata = SyncTexService.metadataPathForPdf(targetFile);
 
+        // The PDF is copied out of a temp folder, so its SyncTeX file and source mapping
+        // metadata must be copied beside it for click navigation to keep working.
         if (!Files.isRegularFile(generatedSyncTex)) {
             Files.deleteIfExists(targetSyncTex);
             Files.deleteIfExists(targetMetadata);

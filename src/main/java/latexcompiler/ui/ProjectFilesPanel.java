@@ -67,6 +67,10 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+/**
+ * Left-side project explorer. It shows a VS Code-style tree, marks files used by the
+ * current LaTeX source, and keeps generated build output out of the way when requested.
+ */
 public final class ProjectFilesPanel extends JPanel {
     private static final int MAX_SCAN_DEPTH = 6;
     private static final int MAX_PROJECT_FILES = 1200;
@@ -853,6 +857,8 @@ public final class ProjectFilesPanel extends JPanel {
             return new ProjectScan(List.of(), 0, List.of());
         }
 
+        // The tree combines two views: all useful files under the project root, and
+        // explicit LaTeX references such as \input, \includegraphics, and bibliography files.
         Set<Path> references = referencesInsideProject(projectRoot, collectReferences(projectRoot, sourceText));
         Map<Path, ProjectFileItem> items = new HashMap<>();
         if (mainFile != null) {
@@ -1103,6 +1109,8 @@ public final class ProjectFilesPanel extends JPanel {
         String fileName = path.getFileName().toString();
         String lowerName = fileName.toLowerCase(Locale.ROOT);
 
+        // Generated files are hidden only when a matching .tex sibling exists. This keeps
+        // real PDFs or assets visible when they are part of the project rather than output.
         String artifactBase;
         if (lowerName.endsWith(".synctex.gz")) {
             artifactBase = lowerName.substring(0, lowerName.length() - ".synctex.gz".length());

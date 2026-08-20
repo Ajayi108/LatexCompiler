@@ -1,11 +1,13 @@
 package latexcompiler.ui;
 
+import latexcompiler.CrashReporter;
 import latexcompiler.export.ExportFormat;
 import latexcompiler.export.ExportResult;
 import latexcompiler.export.ExportService;
 import latexcompiler.files.AppPaths;
 import latexcompiler.format.LatexFormatter;
 import latexcompiler.process.ProcessRunner;
+import latexcompiler.synctex.PdfPosition;
 import latexcompiler.synctex.SourcePosition;
 import latexcompiler.synctex.SyncTexService;
 import latexcompiler.templates.LatexTemplate;
@@ -64,8 +66,13 @@ import javax.swing.event.DocumentListener;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.text.AbstractDocument;
 import javax.swing.text.BadLocationException;
+import javax.swing.text.DefaultHighlighter;
 import javax.swing.text.Element;
+import javax.swing.text.Highlighter;
 import javax.swing.text.JTextComponent;
+import javax.swing.text.Style;
+import javax.swing.text.StyleConstants;
+import javax.swing.text.StyledDocument;
 import javax.swing.undo.AbstractUndoableEdit;
 import javax.swing.undo.CompoundEdit;
 import javax.swing.undo.UndoManager;
@@ -96,6 +103,8 @@ import java.awt.event.MouseMotionAdapter;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -118,8 +127,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.prefs.Preferences;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 public final class MainWindow extends JFrame {
+    // This class is the application coordinator: it owns the top-level layout and wires
+    // together editor state, project files, compiler actions, previews, and dialogs.
+    // Larger feature blocks are kept in separate sections below so they can be split
+    // into smaller classes later without changing behavior at the same time.
     // Auto compile waits for typing to pause so the app does not compile on every keystroke.
     private static final int DEFAULT_AUTO_COMPILE_DELAY_MS = 1500;
     private static final int MIN_AUTO_COMPILE_DELAY_MS = 500;
@@ -128,20 +142,28 @@ public final class MainWindow extends JFrame {
     private static final String THEME_PREF_KEY = "theme";
     private static final String AUTO_COMPILE_DELAY_PREF_KEY = "autoCompileDelayMs";
     private static final String HIDE_GENERATED_FILES_PREF_KEY = "hideGeneratedFiles";
+    private static final String OUTPUT_FOLDER_PREF_KEY = "outputFolder";
     private static final String THEME_SYSTEM_DEFAULT_MIGRATED_KEY = "theme.systemDefaultMigrated";
     private static final String SYSTEM_THEME_ID = "system";
     private static final String LIGHT_THEME_ID = "light";
     private static final String DARK_THEME_ID = "dark";
+    private static final String BUG_REPORT_URL = "https://github.com/Ajayi108/LatexCompiler/issues/new";
     private static final String MENU_CHANGE_LISTENER_KEY = "latex-compiler.menuChangeListener";
+    // Tectonic and LaTeX logs are not one stable format, so issue parsing accepts several
+    // common shapes: direct path errors, classic "! error" lines, and package warnings.
     private static final Pattern LOG_TEX_PATH_WITH_LINE = Pattern.compile("(.+?\\.tex):(\\d+)(?::\\d+)?");
+    private static final Pattern LOG_ISSUE_WITH_PATH = Pattern.compile(
+        "(?i)\\b(error|warning):\\s+(.+?\\.tex):(\\d+)(?::\\d+)?:\\s*(.+)"
+    );
+    private static final Pattern LOG_BANG_ERROR = Pattern.compile("^!\\s+(.+)");
+    private static final Pattern LOG_LATEX_LINE_CONTEXT = Pattern.compile("^l\\.(\\d+)\\s*(.*)");
+    private static final Pattern LOG_PACKAGE_WARNING = Pattern.compile("(?i)^(?:Package|Class)\\s+.+?\\s+Warning:\\s*(.+)");
+    private static final Pattern LOG_BOX_WARNING = Pattern.compile("(?i)\\b(?:Underfull|Overfull)\\\\[hv]box\\b.*?lines?\\s+(\\d+)");
     private static final Pattern WINDOWS_THEME_REGISTRY_VALUE = Pattern.compile(
         "AppsUseLightTheme\\s+REG_DWORD\\s+0x([0-9a-fA-F]+)"
     );
     private static final Pattern LOG_LINE_NUMBER = Pattern.compile("(?i)(?:^|\\b)(?:line|l\\.)\\s*(\\d+)\\b");
-    private static final int COLLAPSED_PROJECT_FILES_WIDTH = 28;
-    private static final int COLLAPSED_PROJECT_FILES_DIVIDER_SIZE = 3;
     private static final String PROJECT_FILES_EXPANDED_CARD = "expanded";
-    private static final String PROJECT_FILES_COLLAPSED_CARD = "collapsed";
     private static final String STARTER_DOCUMENT = """
         \\documentclass[11pt]{article}
         \\usepackage[utf8]{inputenc}
@@ -237,7 +259,7 @@ public final class MainWindow extends JFrame {
         """;
 
     private final JTextPane editor;
-    private final JTextArea logs;
+    private final JTextPane logs;
     private final JLabel status;
     private final JLabel fileStatus;
     private final PdfPreviewPanel pdfPreview;
@@ -252,6 +274,9 @@ public final class MainWindow extends JFrame {
     private final Timer autoCompileTimer;
     private final Timer projectFilesRefreshTimer;
     private LatexSyntaxHighlighter syntaxHighlighter;
+    private final DefaultListModel<CompileIssue> compileIssueModel = new DefaultListModel<>();
+    private final List<CompileIssue> compileIssues = new ArrayList<>();
+    private final List<Object> compileIssueHighlights = new ArrayList<>();
 
     private JToolBar toolbar;
     private JMenuBar menuBar;
@@ -267,6 +292,12 @@ public final class MainWindow extends JFrame {
     private JRadioButtonMenuItem darkThemeItem;
     private JToggleButton autoCompileToggle;
     private JPanel logsPanel;
+    private JList<CompileIssue> compileIssueList;
+    private JScrollPane compileIssueScrollPane;
+    private Style logInfoStyle;
+    private Style logNoteStyle;
+    private Style logWarningStyle;
+    private Style logErrorStyle;
     private JPanel statusBar;
     private JScrollPane editorScrollPane;
     private JTabbedPane editorTabs;
@@ -276,9 +307,17 @@ public final class MainWindow extends JFrame {
     private JTextField replaceField;
     private JCheckBox matchCaseBox;
     private JLabel findStatusLabel;
+    private JDialog projectSearchDialog;
+    private JTextField projectSearchField;
+    private JCheckBox projectSearchCaseBox;
+    private JLabel projectSearchStatusLabel;
+    private DefaultListModel<ProjectSearchResult> projectSearchModel;
+    private JList<ProjectSearchResult> projectSearchList;
     private JDialog templateDialog;
     private DefaultListModel<LatexTemplate> templateModel;
     private JList<LatexTemplate> templateList;
+    private JComboBox<String> templateCategoryFilter;
+    private List<LatexTemplate> allTemplates = List.of();
     private JTextArea templatePreview;
     private PdfPreviewPanel templatePdfPreview;
     private JLabel templateDescriptionLabel;
@@ -294,6 +333,7 @@ public final class MainWindow extends JFrame {
     private Path mainFile;
     private String themeMode;
     private UiTheme theme;
+    private Path outputFolder;
     private int autoCompileDelayMs;
     private boolean hideGeneratedFiles;
     private boolean dirty;
@@ -302,6 +342,8 @@ public final class MainWindow extends JFrame {
     // Export work runs in the background; these flags prevent overlapping compiler processes.
     private boolean operationRunning;
     private boolean compileQueued;
+    private boolean preserveLogsDuringNavigation;
+    private int activeLogLineOffset;
     private CompoundEdit activeCompoundEdit;
     private JPanel projectFilesSlot;
     private CardLayout projectFilesCard;
@@ -327,6 +369,43 @@ public final class MainWindow extends JFrame {
         public String toString() {
             return label;
         }
+    }
+
+    private enum IssueSeverity {
+        ERROR("Error"),
+        WARNING("Warning"),
+        NOTE("Note"),
+        INFO("Info");
+
+        private final String label;
+
+        IssueSeverity(String label) {
+            this.label = label;
+        }
+    }
+
+    private record CompileIssue(
+        IssueSeverity severity,
+        Path sourceFile,
+        int line,
+        String message,
+        String hint,
+        int tokenStart,
+        int tokenEnd
+    ) {
+    }
+
+    private record IssueToken(int start, int end) {
+        private static IssueToken none() {
+            return new IssueToken(-1, -1);
+        }
+
+        private boolean exists() {
+            return start >= 0 && end > start;
+        }
+    }
+
+    private record ProjectSearchResult(Path file, int line, int column, String preview, int matchStart, int matchEnd) {
     }
 
     private static final class OpenFileTab {
@@ -355,6 +434,7 @@ public final class MainWindow extends JFrame {
         this.preferences = Preferences.userNodeForPackage(MainWindow.class);
         this.themeMode = initialThemeMode();
         this.theme = resolveTheme(themeMode);
+        this.outputFolder = loadOutputFolder();
         this.autoCompileDelayMs = loadAutoCompileDelay();
         this.hideGeneratedFiles = preferences.getBoolean(HIDE_GENERATED_FILES_PREF_KEY, true);
         this.editor = createEditor();
@@ -483,7 +563,7 @@ public final class MainWindow extends JFrame {
         area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 15));
         area.setOpaque(true);
         area.putClientProperty(javax.swing.JEditorPane.HONOR_DISPLAY_PROPERTIES, Boolean.TRUE);
-        area.setMargin(new Insets(12, 12, 12, 12));
+        area.setMargin(new Insets(12, 12, 12, 24));
         installEditorShortcuts(area);
         area.getDocument().addDocumentListener(new DocumentListener() {
             @Override
@@ -522,12 +602,11 @@ public final class MainWindow extends JFrame {
         return area;
     }
 
-    private JTextArea createLogs() {
-        JTextArea area = new JTextArea();
+    private JTextPane createLogs() {
+        JTextPane area = new CodeEditorPane();
         area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
         area.setEditable(false);
-        area.setLineWrap(true);
-        area.setWrapStyleWord(true);
+        area.putClientProperty(javax.swing.JEditorPane.HONOR_DISPLAY_PROPERTIES, Boolean.TRUE);
         area.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         area.setToolTipText("Click a log line with a line number to jump to the LaTeX source.");
         area.addMouseListener(new MouseAdapter() {
@@ -544,7 +623,35 @@ public final class MainWindow extends JFrame {
                     : Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
             }
         });
+        installLogStyles(area);
         return area;
+    }
+
+    private void installLogStyles(JTextPane area) {
+        StyledDocument document = area.getStyledDocument();
+        logInfoStyle = document.addStyle("log.info", null);
+        logNoteStyle = document.addStyle("log.note", null);
+        logWarningStyle = document.addStyle("log.warning", null);
+        logErrorStyle = document.addStyle("log.error", null);
+        applyLogStyles();
+    }
+
+    private void applyLogStyles() {
+        if (logInfoStyle == null) {
+            return;
+        }
+
+        styleLogText(logInfoStyle, theme.text(), false);
+        styleLogText(logNoteStyle, theme.mutedText(), false);
+        styleLogText(logWarningStyle, warningColor(), true);
+        styleLogText(logErrorStyle, errorColor(), true);
+    }
+
+    private void styleLogText(Style style, Color color, boolean bold) {
+        StyleConstants.setForeground(style, color);
+        StyleConstants.setBold(style, bold);
+        StyleConstants.setFontFamily(style, Font.MONOSPACED);
+        StyleConstants.setFontSize(style, 13);
     }
 
     private JMenuBar createMenuBar() {
@@ -568,9 +675,10 @@ public final class MainWindow extends JFrame {
         editMenu.add(menuItem("Redo", this::redo, KeyStroke.getKeyStroke(KeyEvent.VK_Y, InputEvent.CTRL_DOWN_MASK)));
         editMenu.addSeparator();
         editMenu.add(menuItem("Find...", this::showFindDialog, KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK)));
+        editMenu.add(menuItem("Find in Project...", this::showProjectSearchDialog, KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK)));
         editMenu.add(menuItem("Find and Replace...", this::showReplaceDialog, KeyStroke.getKeyStroke(KeyEvent.VK_H, InputEvent.CTRL_DOWN_MASK)));
         editMenu.addSeparator();
-        editMenu.add(menuItem("Format LaTeX", this::formatLatex, KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK)));
+        editMenu.add(menuItem("Format LaTeX", this::formatLatex, KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK | InputEvent.ALT_DOWN_MASK)));
 
         JMenu insertMenu = new JMenu("Insert");
         insertMenu.add(menuItem("Templates...", this::showTemplatesDialog, KeyStroke.getKeyStroke(KeyEvent.VK_T, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK)));
@@ -580,6 +688,7 @@ public final class MainWindow extends JFrame {
         toggleLogsMenuItem = menuItem("Hide Logs", this::toggleLogs, null);
         viewMenu.add(toggleFilesMenuItem);
         viewMenu.add(toggleLogsMenuItem);
+        viewMenu.add(menuItem("Show Source Line in PDF", this::showEditorLineInPdf, KeyStroke.getKeyStroke(KeyEvent.VK_J, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK)));
         viewMenu.addSeparator();
         JMenu themeMenu = new JMenu("Theme");
         ButtonGroup themeGroup = new ButtonGroup();
@@ -595,6 +704,7 @@ public final class MainWindow extends JFrame {
         viewMenu.add(themeMenu);
 
         JMenu toolsMenu = new JMenu("Tools");
+        toolsMenu.add(menuItem("Report Bug...", this::showReportBugDialog, null));
         toolsMenu.add(menuItem("Settings...", this::showSettingsDialog, null));
 
         menuBar.add(fileMenu);
@@ -643,7 +753,11 @@ public final class MainWindow extends JFrame {
         toolbar.add(autoCompileToggle);
 
         toolbar.addSeparator();
+        toggleFilesButton = button("Hide Files", this::toggleProjectFiles);
+        toolbar.add(toggleFilesButton);
         toolbar.add(button("Find", this::showFindDialog));
+        toolbar.add(button("Search", this::showProjectSearchDialog));
+        toolbar.add(button("Show in PDF", this::showEditorLineInPdf));
         toolbar.add(button("Templates", this::showTemplatesDialog));
         return toolbar;
     }
@@ -661,11 +775,26 @@ public final class MainWindow extends JFrame {
         return Math.max(MIN_AUTO_COMPILE_DELAY_MS, Math.min(MAX_AUTO_COMPILE_DELAY_MS, stored));
     }
 
+    private Path loadOutputFolder() {
+        String stored = preferences.get(OUTPUT_FOLDER_PREF_KEY, "").trim();
+        return stored.isBlank() ? null : Path.of(stored).toAbsolutePath().normalize();
+    }
+
     private void setAutoCompileDelay(int delayMs) {
         autoCompileDelayMs = Math.max(MIN_AUTO_COMPILE_DELAY_MS, Math.min(MAX_AUTO_COMPILE_DELAY_MS, delayMs));
         preferences.putInt(AUTO_COMPILE_DELAY_PREF_KEY, autoCompileDelayMs);
         autoCompileTimer.setInitialDelay(autoCompileDelayMs);
         autoCompileTimer.setDelay(autoCompileDelayMs);
+    }
+
+    private void setOutputFolder(Path folder) {
+        outputFolder = folder == null ? null : folder.toAbsolutePath().normalize();
+        if (outputFolder == null) {
+            preferences.remove(OUTPUT_FOLDER_PREF_KEY);
+        } else {
+            preferences.put(OUTPUT_FOLDER_PREF_KEY, outputFolder.toString());
+        }
+        loadExistingPdfPreview();
     }
 
     private void setHideGeneratedFiles(boolean hideGeneratedFiles) {
@@ -801,17 +930,42 @@ public final class MainWindow extends JFrame {
         logs.setCaretColor(theme.editorCaret());
         logs.setSelectionColor(theme.editorSelection());
         logs.setSelectedTextColor(theme.editorSelectedText());
+        applyLogStyles();
+        if (compileIssueList != null) {
+            compileIssueList.setBackground(theme.panelBackground());
+            compileIssueList.setForeground(theme.text());
+            compileIssueList.setSelectionBackground(theme.listSelectionBackground());
+            compileIssueList.setSelectionForeground(theme.listSelectionForeground());
+            compileIssueList.repaint();
+        }
+        if (compileIssueScrollPane != null) {
+            compileIssueScrollPane.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, theme.border()));
+            compileIssueScrollPane.getViewport().setBackground(theme.panelBackground());
+        }
         if (syntaxHighlighter != null) {
             syntaxHighlighter.applyTheme(theme);
         }
         if (lineNumberView != null) {
             lineNumberView.applyTheme(theme);
         }
+        refreshCompileIssueHighlights();
         styleEditorTabs();
         projectFilesPanel.applyTheme(theme);
         pdfPreview.applyTheme(theme);
         if (findDialog != null) {
             applyComponentTheme(findDialog.getContentPane());
+        }
+        if (projectSearchDialog != null) {
+            applyComponentTheme(projectSearchDialog.getContentPane());
+            if (projectSearchList != null) {
+                projectSearchList.setBackground(theme.panelBackground());
+                projectSearchList.setForeground(theme.text());
+                projectSearchList.setSelectionBackground(theme.listSelectionBackground());
+                projectSearchList.setSelectionForeground(theme.listSelectionForeground());
+            }
+            if (projectSearchStatusLabel != null) {
+                projectSearchStatusLabel.setForeground(theme.mutedText());
+            }
         }
         if (templateDialog != null) {
             applyComponentTheme(templateDialog.getContentPane());
@@ -870,6 +1024,34 @@ public final class MainWindow extends JFrame {
 
     private Color dialogButtonForeground() {
         return theme.darkMode() ? UiTheme.light().text() : theme.text();
+    }
+
+    private Color errorColor() {
+        return theme.darkMode() ? new Color(255, 123, 114) : new Color(207, 34, 46);
+    }
+
+    private Color warningColor() {
+        return theme.darkMode() ? new Color(255, 199, 94) : new Color(154, 103, 0);
+    }
+
+    private Color noteColor() {
+        return theme.darkMode() ? new Color(121, 192, 255) : new Color(9, 105, 218);
+    }
+
+    private Color issueHighlightColor(IssueSeverity severity) {
+        return switch (severity) {
+            case ERROR -> theme.darkMode() ? new Color(255, 123, 114, 62) : new Color(207, 34, 46, 45);
+            case WARNING -> theme.darkMode() ? new Color(255, 199, 94, 54) : new Color(154, 103, 0, 42);
+            case NOTE, INFO -> theme.darkMode() ? new Color(121, 192, 255, 42) : new Color(9, 105, 218, 32);
+        };
+    }
+
+    private Color issueTokenHighlightColor(IssueSeverity severity) {
+        return switch (severity) {
+            case ERROR -> theme.darkMode() ? new Color(255, 123, 114, 150) : new Color(207, 34, 46, 118);
+            case WARNING -> theme.darkMode() ? new Color(255, 199, 94, 138) : new Color(154, 103, 0, 104);
+            case NOTE, INFO -> theme.darkMode() ? new Color(121, 192, 255, 108) : new Color(9, 105, 218, 84);
+        };
     }
 
     private void applyComponentTheme(Component component) {
@@ -1023,6 +1205,191 @@ public final class MainWindow extends JFrame {
 
     private void showReplaceDialog() {
         openFindReplaceDialog(true);
+    }
+
+    // Project search reads saved project files plus the active editor buffer so unsaved
+    // changes in the current file can still be found before the next save.
+    private void showProjectSearchDialog() {
+        if (projectSearchDialog == null) {
+            createProjectSearchDialog();
+        }
+
+        String selectedText = editor.getSelectedText();
+        if (selectedText != null && !selectedText.isBlank() && !selectedText.contains(System.lineSeparator())) {
+            projectSearchField.setText(selectedText);
+        }
+
+        projectSearchDialog.setLocationRelativeTo(this);
+        projectSearchDialog.setVisible(true);
+        projectSearchField.requestFocusInWindow();
+        projectSearchField.selectAll();
+    }
+
+    private void createProjectSearchDialog() {
+        projectSearchDialog = new JDialog(this, "Find in Project", false);
+        projectSearchDialog.setDefaultCloseOperation(WindowConstants.HIDE_ON_CLOSE);
+
+        projectSearchField = new JTextField(34);
+        projectSearchCaseBox = new JCheckBox("Match case");
+        projectSearchStatusLabel = new JLabel(" ");
+        projectSearchModel = new DefaultListModel<>();
+        projectSearchList = new JList<>(projectSearchModel);
+        projectSearchList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        projectSearchList.setCellRenderer(new ProjectSearchResultRenderer());
+        projectSearchList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent event) {
+                if (event.getClickCount() >= 1) {
+                    openProjectSearchResult(projectSearchList.getSelectedValue());
+                }
+            }
+        });
+        projectSearchField.addActionListener(event -> runProjectSearch());
+
+        JPanel searchRow = new JPanel(new BorderLayout(8, 4));
+        searchRow.add(new JLabel("Find"), BorderLayout.WEST);
+        searchRow.add(projectSearchField, BorderLayout.CENTER);
+        searchRow.add(projectSearchCaseBox, BorderLayout.EAST);
+
+        JPanel buttonRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 6, 0));
+        buttonRow.add(button("Search", this::runProjectSearch));
+        buttonRow.add(button("Close", () -> projectSearchDialog.setVisible(false)));
+
+        JPanel footer = new JPanel(new BorderLayout(8, 0));
+        footer.add(projectSearchStatusLabel, BorderLayout.CENTER);
+        footer.add(buttonRow, BorderLayout.EAST);
+
+        JPanel content = new JPanel(new BorderLayout(8, 8));
+        content.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        content.add(searchRow, BorderLayout.NORTH);
+        content.add(new JScrollPane(projectSearchList), BorderLayout.CENTER);
+        content.add(footer, BorderLayout.SOUTH);
+        projectSearchDialog.setContentPane(content);
+        applyComponentTheme(content);
+        projectSearchDialog.setSize(720, 460);
+    }
+
+    private void runProjectSearch() {
+        if (projectSearchModel == null || projectSearchField == null) {
+            return;
+        }
+
+        String query = projectSearchField.getText();
+        if (query == null || query.isEmpty()) {
+            projectSearchStatusLabel.setText("Enter text");
+            return;
+        }
+
+        Path root = currentProjectRoot;
+        if (root == null && currentFile != null) {
+            root = currentFile.getParent();
+        }
+        if (root == null || !Files.isDirectory(root)) {
+            projectSearchStatusLabel.setText("Open a folder or save a LaTeX file first");
+            return;
+        }
+
+        rememberCurrentOpenTab();
+        projectSearchModel.clear();
+        List<ProjectSearchResult> results = searchProject(root, query, projectSearchCaseBox.isSelected());
+        for (ProjectSearchResult result : results) {
+            projectSearchModel.addElement(result);
+        }
+        projectSearchStatusLabel.setText(results.size() + " match" + (results.size() == 1 ? "" : "es") + " in " + root.getFileName());
+    }
+
+    private List<ProjectSearchResult> searchProject(Path root, String query, boolean matchCase) {
+        List<ProjectSearchResult> results = new ArrayList<>();
+        try (Stream<Path> paths = Files.walk(root, 8)) {
+            paths
+                .filter(Files::isRegularFile)
+                .filter(this::isSearchableProjectFile)
+                .filter(path -> !isGeneratedBuildArtifact(path))
+                .filter(path -> !isInSkippedSearchDirectory(root, path))
+                .sorted()
+                .forEach(path -> collectSearchResults(path, query, matchCase, results));
+        } catch (IOException error) {
+            projectSearchStatusLabel.setText("Search failed: " + error.getMessage());
+        }
+        return results;
+    }
+
+    private void collectSearchResults(Path file, String query, boolean matchCase, List<ProjectSearchResult> results) {
+        if (results.size() >= 500) {
+            return;
+        }
+
+        try {
+            String text = currentFile != null && samePath(file, currentFile)
+                ? editor.getText()
+                : Files.readString(file, StandardCharsets.UTF_8);
+            String[] lines = text.split("\\R", -1);
+            for (int index = 0; index < lines.length && results.size() < 500; index++) {
+                int match = findIndex(lines[index], query, 0, matchCase);
+                while (match >= 0 && results.size() < 500) {
+                    results.add(new ProjectSearchResult(
+                        file.toAbsolutePath().normalize(),
+                        index + 1,
+                        match + 1,
+                        lines[index].strip(),
+                        match,
+                        match + query.length()
+                    ));
+                    match = findIndex(lines[index], query, match + Math.max(1, query.length()), matchCase);
+                }
+            }
+        } catch (IOException ignored) {
+            // Ignore unreadable files during project search; the file tree still remains usable.
+        }
+    }
+
+    private boolean isSearchableProjectFile(Path file) {
+        String name = file.getFileName().toString().toLowerCase(Locale.ROOT);
+        return name.endsWith(".tex")
+            || name.endsWith(".bib")
+            || name.endsWith(".sty")
+            || name.endsWith(".cls")
+            || name.endsWith(".ltx");
+    }
+
+    private boolean isGeneratedBuildArtifact(Path file) {
+        String name = file.getFileName().toString().toLowerCase(Locale.ROOT);
+        return name.endsWith(".aux")
+            || name.endsWith(".log")
+            || name.endsWith(".out")
+            || name.endsWith(".toc")
+            || name.endsWith(".synctex.gz")
+            || name.endsWith(SyncTexService.METADATA_EXTENSION);
+    }
+
+    private boolean isInSkippedSearchDirectory(Path root, Path file) {
+        Path relative = root.toAbsolutePath().normalize().relativize(file.toAbsolutePath().normalize());
+        for (Path part : relative) {
+            String name = part.toString().toLowerCase(Locale.ROOT);
+            if (name.equals(".git") || name.equals("build") || name.equals("installer") || name.equals("tools")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void openProjectSearchResult(ProjectSearchResult result) {
+        if (result == null) {
+            return;
+        }
+
+        openLatexFile(result.file(), true);
+        if (!samePath(result.file(), currentFile)) {
+            return;
+        }
+
+        Element root = editor.getDocument().getDefaultRootElement();
+        int lineIndex = Math.max(0, Math.min(result.line() - 1, root.getElementCount() - 1));
+        Element line = root.getElement(lineIndex);
+        int start = Math.min(line.getEndOffset(), line.getStartOffset() + Math.max(0, result.matchStart()));
+        int end = Math.min(line.getEndOffset(), line.getStartOffset() + Math.max(result.matchStart() + 1, result.matchEnd()));
+        selectEditorRange(start, end);
+        setStatus("Search -> " + result.file().getFileName() + ":" + result.line());
     }
 
     private void openFindReplaceDialog(boolean focusReplace) {
@@ -1232,6 +1599,8 @@ public final class MainWindow extends JFrame {
         templateDialog.setVisible(true);
     }
 
+    // Templates are inserted into the current document, while preview rendering compiles
+    // a temporary document so users can inspect the block without touching their project.
     private void createTemplatesDialog() {
         templateDialog = new JDialog(this, "Templates", false);
         templateDialog.setDefaultCloseOperation(WindowConstants.HIDE_ON_CLOSE);
@@ -1254,6 +1623,8 @@ public final class MainWindow extends JFrame {
         templatePreview.setTabSize(4);
 
         templateDescriptionLabel = new JLabel(" ");
+        templateCategoryFilter = new JComboBox<>();
+        templateCategoryFilter.addActionListener(event -> applyTemplateFilter());
 
         JScrollPane templateListScroll = new JScrollPane(templateList);
         templateListScroll.setPreferredSize(new Dimension(260, 360));
@@ -1301,6 +1672,7 @@ public final class MainWindow extends JFrame {
         title.setFont(title.getFont().deriveFont(Font.BOLD, 15f));
         header.add(title, BorderLayout.WEST);
         header.add(templateDescriptionLabel, BorderLayout.CENTER);
+        header.add(templateCategoryFilter, BorderLayout.EAST);
 
         JPanel content = new JPanel(new BorderLayout(8, 8));
         content.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
@@ -1325,25 +1697,68 @@ public final class MainWindow extends JFrame {
         }
 
         LatexTemplate previousSelection = templateList.getSelectedValue();
-        templateModel.clear();
 
         try {
-            List<LatexTemplate> templates = templateService.loadTemplates();
-            int selectedIndex = -1;
-            for (LatexTemplate template : templates) {
-                templateModel.addElement(template);
-                if (sameTemplate(previousSelection, template)) {
-                    selectedIndex = templateModel.getSize() - 1;
-                }
-            }
-
-            if (templateModel.getSize() > 0) {
-                templateList.setSelectedIndex(selectedIndex >= 0 ? selectedIndex : 0);
-            } else {
-                updateTemplatePreview();
-            }
+            allTemplates = templateService.loadTemplates();
+            refreshTemplateCategories();
+            applyTemplateFilter(previousSelection);
         } catch (IOException error) {
             showError("Could not load templates", error);
+        }
+    }
+
+    private void refreshTemplateCategories() {
+        if (templateCategoryFilter == null) {
+            return;
+        }
+
+        String previous = (String) templateCategoryFilter.getSelectedItem();
+        templateCategoryFilter.removeAllItems();
+        templateCategoryFilter.addItem("All");
+        for (LatexTemplate template : allTemplates) {
+            boolean known = false;
+            for (int index = 0; index < templateCategoryFilter.getItemCount(); index++) {
+                if (template.category().equals(templateCategoryFilter.getItemAt(index))) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                templateCategoryFilter.addItem(template.category());
+            }
+        }
+        if (previous != null) {
+            templateCategoryFilter.setSelectedItem(previous);
+        }
+    }
+
+    private void applyTemplateFilter() {
+        applyTemplateFilter(templateList == null ? null : templateList.getSelectedValue());
+    }
+
+    private void applyTemplateFilter(LatexTemplate preferredSelection) {
+        if (templateModel == null || templateList == null) {
+            return;
+        }
+
+        String category = templateCategoryFilter == null ? "All" : (String) templateCategoryFilter.getSelectedItem();
+        templateModel.clear();
+        int selectedIndex = -1;
+        for (LatexTemplate template : allTemplates) {
+            if (category != null && !"All".equals(category) && !template.category().equals(category)) {
+                continue;
+            }
+
+            templateModel.addElement(template);
+            if (sameTemplate(preferredSelection, template)) {
+                selectedIndex = templateModel.getSize() - 1;
+            }
+        }
+
+        if (templateModel.getSize() > 0) {
+            templateList.setSelectedIndex(selectedIndex >= 0 ? selectedIndex : 0);
+        } else {
+            updateTemplatePreview();
         }
     }
 
@@ -1829,6 +2244,10 @@ public final class MainWindow extends JFrame {
         if (templateDescriptionLabel != null) {
             templateDescriptionLabel.setForeground(theme.mutedText());
         }
+        if (templateCategoryFilter != null) {
+            templateCategoryFilter.setBackground(theme.raisedBackground());
+            templateCategoryFilter.setForeground(theme.text());
+        }
         if (templatePreviewStatusLabel != null) {
             templatePreviewStatusLabel.setForeground(theme.mutedText());
         }
@@ -1837,12 +2256,31 @@ public final class MainWindow extends JFrame {
         }
     }
 
+    private JList<CompileIssue> createCompileIssueList() {
+        JList<CompileIssue> list = new JList<>(compileIssueModel);
+        list.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        list.setVisibleRowCount(3);
+        list.setFixedCellHeight(24);
+        list.setCellRenderer(new CompileIssueRenderer());
+        list.setToolTipText("Click an issue to jump to the source line.");
+        list.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent event) {
+                CompileIssue issue = list.getSelectedValue();
+                if (issue != null && issue.line() > 0) {
+                    navigateToCompileIssue(issue);
+                }
+            }
+        });
+        return list;
+    }
+
     private JPanel createMainContent() {
         editorScrollPane = new JScrollPane(editor);
         editorScrollPane.setBorder(BorderFactory.createTitledBorder("LaTeX Source"));
         lineNumberView = new LineNumberView(editor);
         editorScrollPane.setRowHeaderView(lineNumberView);
-        editorScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+        editorScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
         editorScrollPane.getViewport().setScrollMode(JViewport.SIMPLE_SCROLL_MODE);
         JPanel editorWorkspace = new JPanel(new BorderLayout());
         editorTabs = new JTabbedPane();
@@ -1861,7 +2299,6 @@ public final class MainWindow extends JFrame {
         projectFilesCard = new CardLayout();
         projectFilesSlot = new JPanel(projectFilesCard);
         projectFilesSlot.add(projectFilesPanel, PROJECT_FILES_EXPANDED_CARD);
-        projectFilesSlot.add(createCollapsedProjectFilesPanel(), PROJECT_FILES_COLLAPSED_CARD);
 
         projectWorkspaceSplit = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, projectFilesSlot, editorPreviewWorkspace);
         projectWorkspaceSplit.setResizeWeight(0);
@@ -1871,28 +2308,20 @@ public final class MainWindow extends JFrame {
         logsPanel = new JPanel(new BorderLayout());
         logsPanel.setBorder(BorderFactory.createTitledBorder("Logs"));
         logsPanel.setPreferredSize(new Dimension(100, 190));
-        logsPanel.add(new JScrollPane(logs), BorderLayout.CENTER);
+        compileIssueList = createCompileIssueList();
+        compileIssueScrollPane = new JScrollPane(compileIssueList);
+        compileIssueScrollPane.setPreferredSize(new Dimension(100, 76));
+        compileIssueScrollPane.setVisible(false);
+
+        JPanel logContent = new JPanel(new BorderLayout());
+        logContent.add(compileIssueScrollPane, BorderLayout.NORTH);
+        logContent.add(new JScrollPane(logs), BorderLayout.CENTER);
+        logsPanel.add(logContent, BorderLayout.CENTER);
 
         JPanel content = new JPanel(new BorderLayout());
         content.add(projectWorkspaceSplit, BorderLayout.CENTER);
         content.add(logsPanel, BorderLayout.SOUTH);
         return content;
-    }
-
-    private JPanel createCollapsedProjectFilesPanel() {
-        JPanel panel = new JPanel(new BorderLayout());
-        panel.setMinimumSize(new Dimension(COLLAPSED_PROJECT_FILES_WIDTH, 120));
-        panel.setPreferredSize(new Dimension(COLLAPSED_PROJECT_FILES_WIDTH, 100));
-
-        JButton showButton = new JButton(">");
-        showButton.setFocusable(false);
-        showButton.setMargin(new Insets(4, 2, 4, 2));
-        showButton.setMinimumSize(new Dimension(COLLAPSED_PROJECT_FILES_WIDTH - 4, 30));
-        showButton.setPreferredSize(new Dimension(COLLAPSED_PROJECT_FILES_WIDTH - 4, 30));
-        showButton.setToolTipText("Show project files");
-        showButton.addActionListener(event -> setProjectFilesVisible(true));
-        panel.add(showButton, BorderLayout.NORTH);
-        return panel;
     }
 
     private void handleEditorTabSelection() {
@@ -2129,7 +2558,7 @@ public final class MainWindow extends JFrame {
         mainFile = null;
         stopProjectWatcher();
         loadStarterDocument();
-        logs.setText("");
+        clearLogs();
         pdfPreview.clear("Compile a document to preview the PDF here.");
         projectFilesPanel.clear();
         setStatus("New document");
@@ -2191,7 +2620,7 @@ public final class MainWindow extends JFrame {
         dirty = false;
         resetUndoHistory();
         refreshSyntaxHighlighting();
-        logs.setText("");
+        clearLogs();
         pdfPreview.clear("Create or open a .tex file to preview the PDF here.");
         refreshProjectFiles();
         setProjectFilesVisible(true);
@@ -2257,7 +2686,11 @@ public final class MainWindow extends JFrame {
             refreshSyntaxHighlighting();
             refreshProjectFiles();
             refreshEditorTabs();
-            logs.setText("");
+            if (preserveLogsDuringNavigation) {
+                refreshCompileIssueHighlights();
+            } else {
+                clearLogs();
+            }
             loadExistingPdfPreview();
             setStatus("Opened " + selected);
             autoCompileTimer.stop();
@@ -2368,7 +2801,8 @@ public final class MainWindow extends JFrame {
         runExport(format, target, "Exporting " + format.label() + "...", format != ExportFormat.PDF, false);
     }
 
-    // Manual and auto compile both update the right-side PDF preview.
+    // Manual and auto compile share the same path so preview updates, logs, and issue
+    // parsing stay consistent no matter how the compile was triggered.
     private void compilePdf(boolean automatic) {
         if (operationRunning) {
             if (automatic) {
@@ -2385,7 +2819,8 @@ public final class MainWindow extends JFrame {
         runExport(ExportFormat.PDF, target, automatic ? "Auto compiling PDF..." : "Compiling PDF...", false, automatic);
     }
 
-    // SwingWorker keeps the editor responsive while Tectonic or Pandoc runs.
+    // SwingWorker keeps the editor responsive while Tectonic or Pandoc runs. If another
+    // auto compile is requested during a run, compileQueued schedules one more pass.
     private void runExport(ExportFormat format, Path target, String startMessage, boolean openAfterSuccess, boolean automatic) {
         Path source = compileSourceFile();
         if (source == null) {
@@ -2393,7 +2828,7 @@ public final class MainWindow extends JFrame {
             return;
         }
 
-        logs.setText("");
+        clearLogs();
         appendLog("Source: " + source);
         appendLog((automatic ? "Auto compile" : format.label()) + " target: " + target);
         setStatus(startMessage);
@@ -2418,6 +2853,7 @@ public final class MainWindow extends JFrame {
                 try {
                     ExportResult result = get();
                     appendLog(result.log());
+                    updateCompileIssues(result.log(), result.lineOffset());
                     if (result.success()) {
                         setStatus((automatic ? "Auto compiled " : "Created ") + result.outputFile());
                         if (format == ExportFormat.PDF) {
@@ -2428,7 +2864,7 @@ public final class MainWindow extends JFrame {
                             openGeneratedFile(result.outputFile());
                         }
                     } else {
-                        setStatus((automatic ? "Auto compile" : format.label() + " export") + " failed");
+                        setStatus(failedCompileStatus(format, automatic));
                         if (!automatic) {
                             setLogsVisible(true);
                         }
@@ -2448,6 +2884,18 @@ public final class MainWindow extends JFrame {
             }
         };
         worker.execute();
+    }
+
+    private String failedCompileStatus(ExportFormat format, boolean automatic) {
+        Optional<CompileIssue> firstError = compileIssues.stream()
+            .filter(issue -> issue.severity() == IssueSeverity.ERROR)
+            .findFirst();
+        if (firstError.isPresent()) {
+            CompileIssue issue = firstError.get();
+            String line = issue.line() > 0 ? " on line " + issue.line() : "";
+            return (automatic ? "Auto compile" : format.label() + " export") + " failed: " + issue.severity().label + line;
+        }
+        return (automatic ? "Auto compile" : format.label() + " export") + " failed";
     }
 
     // Auto compile cannot show a Save As dialog, so unsaved documents wait for manual save.
@@ -2525,7 +2973,10 @@ public final class MainWindow extends JFrame {
         String fileName = source.getFileName().toString();
         int dot = fileName.lastIndexOf('.');
         String base = dot > 0 ? fileName.substring(0, dot) : fileName;
-        Path parent = source.toAbsolutePath().getParent();
+        Path parent = outputFolder != null ? outputFolder : source.toAbsolutePath().getParent();
+        if (parent == null) {
+            parent = currentProjectRoot != null ? currentProjectRoot : Path.of(".").toAbsolutePath().normalize();
+        }
         return parent.resolve(base + "." + format.extension());
     }
 
@@ -2584,6 +3035,41 @@ public final class MainWindow extends JFrame {
         }
     }
 
+    private void showEditorLineInPdf() {
+        Path mainSource = compileSourceFile();
+        if (mainSource == null) {
+            setStatus("Choose a main LaTeX source before using source-to-PDF sync.");
+            return;
+        }
+
+        Path editorSource = currentFile != null && Files.isRegularFile(currentFile) ? currentFile : mainSource;
+        Path pdf = defaultExportFile(ExportFormat.PDF);
+        if (!Files.isRegularFile(pdf)) {
+            setStatus("Compile the PDF before using source-to-PDF sync.");
+            return;
+        }
+
+        int sourceLine = currentEditorLine();
+        try {
+            Optional<PdfPosition> position = syncTexService.findPdfPosition(pdf, editorSource, sourceLine);
+            if (position.isEmpty()) {
+                setStatus("No SyncTeX match for this source line. Recompile and try again.");
+                return;
+            }
+
+            PdfPosition pdfPosition = position.get();
+            pdfPreview.loadPdf(pdf);
+            pdfPreview.jumpToPosition(pdfPosition.page(), pdfPosition.normalizedX(), pdfPosition.normalizedY());
+            setStatus("Source line " + sourceLine + " -> PDF page " + pdfPosition.page());
+        } catch (IOException error) {
+            setStatus("Could not sync source to PDF: " + error.getMessage());
+        }
+    }
+
+    private int currentEditorLine() {
+        return editor.getDocument().getDefaultRootElement().getElementIndex(editor.getCaretPosition()) + 1;
+    }
+
     private void navigateFromOutline(Path sourceFile, int lineNumber) {
         if (sourceFile != null && Files.isRegularFile(sourceFile) && !samePath(sourceFile, currentFile)) {
             openLatexFile(sourceFile, true);
@@ -2627,6 +3113,175 @@ public final class MainWindow extends JFrame {
             .equalsIgnoreCase(second.toAbsolutePath().normalize().toString());
     }
 
+    // Bug reports are user-approved. The app can include system context and the latest
+    // local crash log, but nothing leaves the machine until the user opens or copies it.
+    private void showReportBugDialog() {
+        JDialog dialog = new JDialog(this, "Report Bug", true);
+        dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+
+        JTextField titleField = new JTextField("Bug report", 38);
+        JTextArea descriptionArea = reportTextArea("What went wrong?");
+        JTextArea stepsArea = reportTextArea("1. Open...\n2. Click...\n3. See...");
+        JCheckBox includeContext = new JCheckBox("Include app and system context", true);
+        Optional<Path> latestCrashLog = CrashReporter.latestCrashLog();
+        JCheckBox includeCrashLog = new JCheckBox("Include latest crash log. It may contain local paths.", false);
+        includeCrashLog.setEnabled(latestCrashLog.isPresent());
+
+        JLabel crashLogLabel = new JLabel(latestCrashLog
+            .map(path -> "Latest crash log: " + path.getFileName())
+            .orElse("No crash log found."));
+
+        JButton openIssue = button("Open GitHub Issue", () -> {
+            String body = buildBugReportBody(
+                descriptionArea.getText(),
+                stepsArea.getText(),
+                includeContext.isSelected(),
+                includeCrashLog.isSelected()
+            );
+            openBugReportIssue(titleField.getText(), body);
+            dialog.dispose();
+        });
+        JButton copyReport = button("Copy Report", () -> {
+            String body = buildBugReportBody(
+                descriptionArea.getText(),
+                stepsArea.getText(),
+                includeContext.isSelected(),
+                includeCrashLog.isSelected()
+            );
+            copyBugReportToClipboard(titleField.getText(), body);
+            setStatus("Copied bug report");
+        });
+        JButton cancel = button("Cancel", dialog::dispose);
+
+        JPanel form = new JPanel();
+        form.setLayout(new BoxLayout(form, BoxLayout.Y_AXIS));
+        form.add(fieldRow("Title", titleField));
+        form.add(reportSection("What happened", descriptionArea));
+        form.add(reportSection("Steps", stepsArea));
+
+        JPanel optionRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0));
+        optionRow.add(includeContext);
+        form.add(optionRow);
+
+        JPanel crashRow = new JPanel(new BorderLayout(8, 0));
+        crashRow.add(includeCrashLog, BorderLayout.WEST);
+        crashRow.add(crashLogLabel, BorderLayout.CENTER);
+        form.add(crashRow);
+
+        JPanel buttonRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 6, 0));
+        buttonRow.add(copyReport);
+        buttonRow.add(openIssue);
+        buttonRow.add(cancel);
+
+        JPanel content = new JPanel(new BorderLayout(8, 8));
+        content.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        content.add(form, BorderLayout.CENTER);
+        content.add(buttonRow, BorderLayout.SOUTH);
+        applyComponentTheme(content);
+
+        dialog.setContentPane(content);
+        dialog.setSize(680, 560);
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+    }
+
+    private JTextArea reportTextArea(String placeholder) {
+        JTextArea textArea = new JTextArea(placeholder, 5, 44);
+        textArea.setLineWrap(true);
+        textArea.setWrapStyleWord(true);
+        return textArea;
+    }
+
+    private JPanel reportSection(String labelText, JTextArea textArea) {
+        JPanel panel = new JPanel(new BorderLayout(8, 4));
+        panel.setBorder(BorderFactory.createEmptyBorder(4, 0, 4, 0));
+        panel.add(new JLabel(labelText), BorderLayout.NORTH);
+        panel.add(new JScrollPane(textArea), BorderLayout.CENTER);
+        return panel;
+    }
+
+    private String buildBugReportBody(String description, String steps, boolean includeContext, boolean includeCrashLog) {
+        StringBuilder body = new StringBuilder();
+        body.append("## What happened\n");
+        body.append(reportValue(description, "Describe the bug here.")).append("\n\n");
+        body.append("## Steps to reproduce\n");
+        body.append(reportValue(steps, "1. \n2. \n3. ")).append("\n\n");
+        body.append("## Expected behavior\n");
+        body.append("Describe what you expected to happen.").append("\n\n");
+
+        if (includeContext) {
+            body.append("## App context\n");
+            body.append(bugReportContext()).append("\n");
+        }
+
+        if (includeCrashLog) {
+            String crashLog = CrashReporter.latestCrashLogText();
+            if (!crashLog.isBlank()) {
+                body.append("## Latest crash log\n");
+                body.append("```text\n");
+                body.append(crashLog.replace("```", "'''"));
+                body.append("\n```\n");
+            }
+        }
+
+        return body.toString();
+    }
+
+    private String bugReportContext() {
+        return ""
+            + "- App version: " + CrashReporter.appVersion() + "\n"
+            + "- Java: " + System.getProperty("java.version") + "\n"
+            + "- OS: " + System.getProperty("os.name") + " "
+            + System.getProperty("os.version") + " "
+            + System.getProperty("os.arch") + "\n"
+            + "- Theme: " + themeModeLabel() + "\n"
+            + "- Auto compile: " + (autoCompileToggle != null && autoCompileToggle.isSelected() ? "on" : "off") + "\n"
+            + "- Project open: " + (currentProjectRoot == null ? "no" : "yes") + "\n"
+            + "- Main source selected: " + (compileSourceFile() == null ? "no" : "yes") + "\n"
+            + "- Custom output folder: " + (outputFolder == null ? "no" : "yes") + "\n"
+            + "- Visible compile issues: " + compileIssues.size() + "\n"
+            + "- Last status: " + status.getText() + "\n";
+    }
+
+    private String reportValue(String text, String fallback) {
+        String value = text == null ? "" : text.trim();
+        return value.isBlank() ? fallback : value;
+    }
+
+    private void openBugReportIssue(String title, String body) {
+        String safeTitle = reportValue(title, "Bug report");
+        String issueUrl = BUG_REPORT_URL
+            + "?title=" + encodeQuery(safeTitle)
+            + "&body=" + encodeQuery(body);
+
+        try {
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+                Desktop.getDesktop().browse(URI.create(issueUrl));
+                setStatus("Opened GitHub bug report");
+                return;
+            }
+        } catch (Exception ignored) {
+            // Fall back to clipboard below so the user never loses the report text.
+        }
+
+        copyBugReportToClipboard(safeTitle, body);
+        JOptionPane.showMessageDialog(
+            this,
+            "Could not open the browser, so the bug report was copied to your clipboard.",
+            "Report Bug",
+            JOptionPane.INFORMATION_MESSAGE
+        );
+    }
+
+    private void copyBugReportToClipboard(String title, String body) {
+        String report = "Title:\n" + reportValue(title, "Bug report") + "\n\nBody:\n" + body;
+        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(report), null);
+    }
+
+    private String encodeQuery(String value) {
+        return URLEncoder.encode(value == null ? "" : value, StandardCharsets.UTF_8);
+    }
+
     private void showSettingsDialog() {
         JDialog dialog = new JDialog(this, "Settings", true);
         dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
@@ -2650,6 +3305,7 @@ public final class MainWindow extends JFrame {
             250
         ));
         JCheckBox hideBuildFiles = new JCheckBox("Hide generated LaTeX build files", hideGeneratedFiles);
+        JTextField outputFolderField = new JTextField(outputFolder == null ? "" : outputFolder.toString(), 34);
         JTextArea pathsText = new JTextArea(settingsSummary());
         pathsText.setEditable(false);
         pathsText.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
@@ -2664,12 +3320,15 @@ public final class MainWindow extends JFrame {
             installToolFromSettings(ToolType.PANDOC);
         });
         JButton openTemplates = button("Templates Folder", this::openTemplatesFolder);
+        JButton browseOutputFolder = button("Browse Output", () -> chooseOutputFolder(outputFolderField));
+        JButton resetOutputFolder = button("Reset Output", () -> outputFolderField.setText(""));
         JButton apply = button("Apply", () -> {
             ThemeChoice selectedTheme = (ThemeChoice) themeSelector.getSelectedItem();
             if (selectedTheme != null) {
                 setThemeMode(selectedTheme.id());
             }
             setAutoCompileDelay((Integer) delaySpinner.getValue());
+            applyOutputFolderSetting(outputFolderField.getText());
             setHideGeneratedFiles(hideBuildFiles.isSelected());
             pathsText.setText(settingsSummary());
             pathsText.setCaretPosition(0);
@@ -2681,6 +3340,8 @@ public final class MainWindow extends JFrame {
         buttonRow.add(installTectonic);
         buttonRow.add(installPandoc);
         buttonRow.add(openTemplates);
+        buttonRow.add(browseOutputFolder);
+        buttonRow.add(resetOutputFolder);
         buttonRow.add(apply);
         buttonRow.add(close);
 
@@ -2688,6 +3349,7 @@ public final class MainWindow extends JFrame {
         controls.setLayout(new BoxLayout(controls, BoxLayout.Y_AXIS));
         controls.add(comboRow("Theme", themeSelector));
         controls.add(spinnerRow("Auto compile ms", delaySpinner));
+        controls.add(fieldRow("Output", outputFolderField));
         JPanel checkRow = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0));
         checkRow.add(hideBuildFiles);
         controls.add(checkRow);
@@ -2705,6 +3367,37 @@ public final class MainWindow extends JFrame {
         dialog.setVisible(true);
     }
 
+    private void chooseOutputFolder(JTextField outputFolderField) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Choose Output Folder");
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        chooser.setAcceptAllFileFilterUsed(false);
+        if (outputFolder != null) {
+            chooser.setCurrentDirectory(outputFolder.toFile());
+        } else if (currentProjectRoot != null) {
+            chooser.setCurrentDirectory(currentProjectRoot.toFile());
+        }
+        if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            outputFolderField.setText(chooser.getSelectedFile().toPath().toAbsolutePath().normalize().toString());
+        }
+    }
+
+    private void applyOutputFolderSetting(String text) {
+        String value = text == null ? "" : text.trim();
+        if (value.isBlank() || value.equals("(same as main file)")) {
+            setOutputFolder(null);
+            return;
+        }
+
+        Path folder = Path.of(value).toAbsolutePath().normalize();
+        try {
+            Files.createDirectories(folder);
+            setOutputFolder(folder);
+        } catch (IOException error) {
+            showError("Could not use output folder", error);
+        }
+    }
+
     private String settingsSummary() {
         StringBuilder summary = new StringBuilder();
         summary.append("Java\n");
@@ -2712,6 +3405,8 @@ public final class MainWindow extends JFrame {
         summary.append("  Runtime: ").append(System.getProperty("java.home")).append("\n\n");
 
         summary.append("Tools\n");
+        summary.append("  PDF engine: Tectonic (XeTeX)\n");
+        summary.append("  Word engine: Pandoc\n");
         summary.append(toolStatusLine(ToolType.TECTONIC));
         summary.append(toolStatusLine(ToolType.PANDOC));
         summary.append("  Managed tools folder: ").append(AppPaths.managedToolsDirectory()).append('\n');
@@ -2764,14 +3459,17 @@ public final class MainWindow extends JFrame {
     }
 
     private String outputFolderText() {
+        if (outputFolder != null) {
+            return outputFolder.toString();
+        }
         Path source = compileSourceFile();
         if (source != null && source.getParent() != null) {
-            return source.getParent().toString();
+            return source.getParent().toString() + " (same as main file)";
         }
         if (currentProjectRoot != null) {
-            return currentProjectRoot.toString();
+            return currentProjectRoot + " (same as main file)";
         }
-        return "(none)";
+        return "(same as main file)";
     }
 
     private void installToolFromSettings(ToolType toolType) {
@@ -2781,7 +3479,7 @@ public final class MainWindow extends JFrame {
         }
 
         setStatus("Installing " + toolType.displayName() + "...");
-        logs.setText("");
+        clearLogs();
         setLogsVisible(true);
         operationRunning = true;
         setToolbarEnabled(false);
@@ -2873,10 +3571,6 @@ public final class MainWindow extends JFrame {
 
         if (!isUsableProjectRoot(projectRoot)) {
             setStatus("Save the current LaTeX file before creating project files.");
-            return;
-        }
-
-        if (!confirmDiscardUnsavedChanges()) {
             return;
         }
 
@@ -3108,6 +3802,11 @@ public final class MainWindow extends JFrame {
             return false;
         }
 
+        if (currentProjectRoot != null && !isSameOrInside(currentProjectRoot, item.toAbsolutePath().normalize())) {
+            setStatus("Project file actions stay inside " + currentProjectRoot);
+            return false;
+        }
+
         return true;
     }
 
@@ -3145,6 +3844,15 @@ public final class MainWindow extends JFrame {
                 this,
                 "Choose an existing folder.",
                 "Invalid Folder",
+                JOptionPane.WARNING_MESSAGE
+            );
+            return null;
+        }
+        if (currentProjectRoot != null && !isSameOrInside(currentProjectRoot, destination)) {
+            JOptionPane.showMessageDialog(
+                this,
+                "Choose a folder inside the current project root:\n" + currentProjectRoot,
+                "Outside Project",
                 JOptionPane.WARNING_MESSAGE
             );
             return null;
@@ -3291,7 +3999,7 @@ public final class MainWindow extends JFrame {
         refreshSyntaxHighlighting();
         refreshEditorTabs();
         pdfPreview.clear("Create or open a .tex file to preview the PDF here.");
-        logs.setText("");
+        clearLogs();
         updateTitle();
     }
 
@@ -3568,11 +4276,366 @@ public final class MainWindow extends JFrame {
         if (message == null || message.isBlank()) {
             return;
         }
-        logs.append(message);
-        if (!message.endsWith(System.lineSeparator())) {
-            logs.append(System.lineSeparator());
+
+        String normalized = message.replace("\r\n", "\n").replace('\r', '\n');
+        String[] lines = normalized.split("\n", -1);
+        for (int index = 0; index < lines.length; index++) {
+            if (index == lines.length - 1 && lines[index].isEmpty()) {
+                continue;
+            }
+            appendLogLine(lines[index]);
         }
         logs.setCaretPosition(logs.getDocument().getLength());
+    }
+
+    private void appendLogLine(String line) {
+        StyledDocument document = logs.getStyledDocument();
+        try {
+            document.insertString(document.getLength(), line + System.lineSeparator(), logStyleForLine(line));
+        } catch (BadLocationException ignored) {
+            // If the log changes during a repaint, the next compiler message will still be appended.
+        }
+    }
+
+    private Style logStyleForLine(String line) {
+        IssueSeverity severity = classifyLogLine(line);
+        return switch (severity) {
+            case ERROR -> logErrorStyle;
+            case WARNING -> logWarningStyle;
+            case NOTE -> logNoteStyle;
+            case INFO -> logInfoStyle;
+        };
+    }
+
+    private IssueSeverity classifyLogLine(String line) {
+        String trimmed = line.stripLeading();
+        String lower = trimmed.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("error:")
+            || lower.startsWith("!")
+            || lower.contains("no pages of output")
+            || lower.contains("unrecoverable error")) {
+            return IssueSeverity.ERROR;
+        }
+        if (lower.startsWith("warning:")
+            || lower.contains(" warning:")
+            || lower.startsWith("fontconfig error")
+            || lower.contains("underfull \\")
+            || lower.contains("overfull \\")) {
+            return IssueSeverity.WARNING;
+        }
+        if (lower.startsWith("note:")) {
+            return IssueSeverity.NOTE;
+        }
+        return IssueSeverity.INFO;
+    }
+
+    private void clearLogs() {
+        logs.setText("");
+        activeLogLineOffset = 0;
+        compileIssues.clear();
+        compileIssueModel.clear();
+        updateCompileIssuePanelVisibility();
+        clearCompileIssueHighlights();
+    }
+
+    private void updateCompileIssues(String log, int lineOffset) {
+        activeLogLineOffset = Math.max(0, lineOffset);
+        compileIssues.clear();
+        compileIssueModel.clear();
+
+        for (CompileIssue issue : parseCompileIssues(log == null ? "" : log, activeLogLineOffset)) {
+            compileIssues.add(issue);
+            compileIssueModel.addElement(issue);
+        }
+
+        updateCompileIssuePanelVisibility();
+        refreshCompileIssueHighlights();
+    }
+
+    // Compiler output mixes engine errors, package warnings, and TeX continuation lines.
+    // This parser collects the most useful line references and removes duplicates so the
+    // issue list stays readable after a noisy compile failure.
+    private List<CompileIssue> parseCompileIssues(String log, int lineOffset) {
+        Map<String, CompileIssue> parsed = new LinkedHashMap<>();
+        String pendingBangError = null;
+
+        for (String line : log.replace("\r\n", "\n").replace('\r', '\n').split("\n")) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+
+            Matcher pathIssue = LOG_ISSUE_WITH_PATH.matcher(trimmed);
+            if (pathIssue.find()) {
+                IssueSeverity severity = "warning".equalsIgnoreCase(pathIssue.group(1))
+                    ? IssueSeverity.WARNING
+                    : IssueSeverity.ERROR;
+                Path source = resolveLogSourcePath(pathIssue.group(2));
+                int sourceLine = translateLogLine(parsePositiveInt(pathIssue.group(3)), lineOffset);
+                addCompileIssue(parsed, severity, source, sourceLine, pathIssue.group(4));
+                continue;
+            }
+
+            Matcher bangError = LOG_BANG_ERROR.matcher(trimmed);
+            if (bangError.find()) {
+                pendingBangError = bangError.group(1);
+                continue;
+            }
+
+            Matcher lineContext = LOG_LATEX_LINE_CONTEXT.matcher(trimmed);
+            if (lineContext.find() && pendingBangError != null) {
+                int sourceLine = translateLogLine(parsePositiveInt(lineContext.group(1)), lineOffset);
+                String message = pendingBangError;
+                if (!lineContext.group(2).isBlank()) {
+                    message += " near `" + lineContext.group(2).trim() + "`";
+                }
+                addCompileIssue(parsed, IssueSeverity.ERROR, compileSourceFile(), sourceLine, message);
+                pendingBangError = null;
+                continue;
+            }
+
+            Matcher boxWarning = LOG_BOX_WARNING.matcher(trimmed);
+            if (boxWarning.find()) {
+                int sourceLine = translateLogLine(parsePositiveInt(boxWarning.group(1)), lineOffset);
+                addCompileIssue(parsed, IssueSeverity.WARNING, compileSourceFile(), sourceLine, trimmed);
+                continue;
+            }
+
+            Matcher packageWarning = LOG_PACKAGE_WARNING.matcher(trimmed);
+            if (packageWarning.find()) {
+                addCompileIssue(parsed, IssueSeverity.WARNING, compileSourceFile(), 0, trimmed);
+            }
+        }
+
+        return new ArrayList<>(parsed.values());
+    }
+
+    private void addCompileIssue(
+        Map<String, CompileIssue> issues,
+        IssueSeverity severity,
+        Path sourceFile,
+        int line,
+        String rawMessage
+    ) {
+        String message = cleanIssueMessage(rawMessage);
+        if (message.isBlank()) {
+            return;
+        }
+
+        String sourceLine = sourceLineText(sourceFile, line);
+        IssueToken token = issueToken(message, sourceLine);
+        String key = severity + "|"
+            + (sourceFile == null ? "" : sourceFile.toAbsolutePath().normalize())
+            + "|" + line
+            + "|" + message.toLowerCase(Locale.ROOT);
+        issues.putIfAbsent(key, new CompileIssue(
+            severity,
+            sourceFile,
+            line,
+            message,
+            issueHint(message, sourceLine, line),
+            token.start(),
+            token.end()
+        ));
+    }
+
+    private String cleanIssueMessage(String rawMessage) {
+        return rawMessage
+            .replaceFirst("(?i)^LaTeX Error:\\s*", "")
+            .replaceFirst("(?i)^Package\\s+.+?\\s+Error:\\s*", "")
+            .trim();
+    }
+
+    private int translateLogLine(int rawLine, int lineOffset) {
+        return Math.max(1, rawLine - Math.max(0, lineOffset));
+    }
+
+    private String issueHint(String message, String sourceLine, int line) {
+        String lower = message.toLowerCase(Locale.ROOT);
+
+        if (lower.contains("missing $ inserted")) {
+            if (containsUnescaped(sourceLine, '_')) {
+                return "Likely caused by an unescaped underscore on this line. Use \\_ or put the expression in math mode.";
+            }
+            if (containsUnescaped(sourceLine, '^')) {
+                return "Likely caused by ^ outside math mode. Escape it or put the expression in math mode.";
+            }
+            return "Usually means a math-only character is being used in normal text.";
+        }
+        if (lower.contains("there's no line here to end") || lower.contains("there is no line here to end")) {
+            return "Likely caused by \\\\ where LaTeX cannot break a line. Remove it or use a paragraph break/spacing command.";
+        }
+        if (lower.contains("undefined control sequence")) {
+            return "A command is probably misspelled, or the package that defines it is missing.";
+        }
+        if (lower.contains("file") && lower.contains("not found")) {
+            return "Check the referenced file name or path, especially images, inputs, bibliography files, and packages.";
+        }
+        if (lower.contains("missing }") || lower.contains("extra }") || lower.contains("runaway argument")) {
+            return "Check for an unmatched brace near this line or just above it.";
+        }
+        if (lower.contains("environment") && lower.contains("undefined")) {
+            return "The environment name may be misspelled, or the package that provides it is missing.";
+        }
+        if (lower.contains("underfull") || lower.contains("overfull")) {
+            return "Layout warning only. The PDF may compile, but spacing on this line may look poor.";
+        }
+        if (line > 0) {
+            return "The compiler pointed here. Also check the previous line, because LaTeX errors often start earlier.";
+        }
+        return "Compiler message without a precise source line.";
+    }
+
+    private IssueToken issueToken(String message, String sourceLine) {
+        if (sourceLine == null || sourceLine.isBlank()) {
+            return IssueToken.none();
+        }
+
+        String lower = message.toLowerCase(Locale.ROOT);
+        if (lower.contains("missing $ inserted")) {
+            IssueToken underscore = firstUnescapedToken(sourceLine, '_');
+            if (underscore.exists()) {
+                return underscore;
+            }
+            IssueToken caret = firstUnescapedToken(sourceLine, '^');
+            if (caret.exists()) {
+                return caret;
+            }
+        }
+
+        if (lower.contains("missing }") || lower.contains("extra }") || lower.contains("runaway argument")) {
+            IssueToken brace = lastToken(sourceLine, '{');
+            if (brace.exists()) {
+                return brace;
+            }
+            return lastToken(sourceLine, '}');
+        }
+
+        if (lower.contains("undefined control sequence")) {
+            Matcher command = Pattern.compile("\\\\[a-zA-Z@]+").matcher(sourceLine);
+            if (command.find()) {
+                return new IssueToken(command.start(), command.end());
+            }
+        }
+
+        return IssueToken.none();
+    }
+
+    private IssueToken firstUnescapedToken(String text, char target) {
+        boolean escaped = false;
+        for (int index = 0; index < text.length(); index++) {
+            char current = text.charAt(index);
+            if (current == '\\' && !escaped) {
+                escaped = true;
+                continue;
+            }
+            if (current == target && !escaped) {
+                return new IssueToken(index, index + 1);
+            }
+            escaped = false;
+        }
+        return IssueToken.none();
+    }
+
+    private IssueToken lastToken(String text, char target) {
+        int index = text.lastIndexOf(target);
+        return index < 0 ? IssueToken.none() : new IssueToken(index, index + 1);
+    }
+
+    private String sourceLineText(Path sourceFile, int lineNumber) {
+        if (lineNumber < 1 || sourceFile == null || currentFile == null || !samePath(sourceFile, currentFile)) {
+            return "";
+        }
+
+        try {
+            Element root = editor.getDocument().getDefaultRootElement();
+            if (lineNumber > root.getElementCount()) {
+                return "";
+            }
+            Element line = root.getElement(lineNumber - 1);
+            int length = Math.max(0, line.getEndOffset() - line.getStartOffset());
+            return editor.getDocument().getText(line.getStartOffset(), length);
+        } catch (BadLocationException ignored) {
+            return "";
+        }
+    }
+
+    private boolean containsUnescaped(String text, char target) {
+        boolean escaped = false;
+        for (int index = 0; index < text.length(); index++) {
+            char current = text.charAt(index);
+            if (current == '\\' && !escaped) {
+                escaped = true;
+                continue;
+            }
+            if (current == target && !escaped) {
+                return true;
+            }
+            escaped = false;
+        }
+        return false;
+    }
+
+    private void updateCompileIssuePanelVisibility() {
+        if (compileIssueScrollPane == null) {
+            return;
+        }
+        compileIssueScrollPane.setVisible(!compileIssueModel.isEmpty());
+        logsPanel.revalidate();
+        logsPanel.repaint();
+    }
+
+    private void clearCompileIssueHighlights() {
+        Highlighter highlighter = editor.getHighlighter();
+        for (Object tag : compileIssueHighlights) {
+            highlighter.removeHighlight(tag);
+        }
+        compileIssueHighlights.clear();
+    }
+
+    private void refreshCompileIssueHighlights() {
+        if (editor == null) {
+            return;
+        }
+
+        clearCompileIssueHighlights();
+        for (CompileIssue issue : compileIssues) {
+            if (issue.line() < 1 || currentFile == null || issue.sourceFile() == null || !samePath(issue.sourceFile(), currentFile)) {
+                continue;
+            }
+            highlightIssueLine(issue);
+        }
+    }
+
+    private void highlightIssueLine(CompileIssue issue) {
+        try {
+            Element root = editor.getDocument().getDefaultRootElement();
+            if (issue.line() > root.getElementCount()) {
+                return;
+            }
+            Element line = root.getElement(issue.line() - 1);
+            int start = line.getStartOffset();
+            int end = Math.min(line.getEndOffset(), editor.getDocument().getLength());
+            Object tag = editor.getHighlighter().addHighlight(
+                start,
+                end,
+                new DefaultHighlighter.DefaultHighlightPainter(issueHighlightColor(issue.severity()))
+            );
+            compileIssueHighlights.add(tag);
+
+            if (issue.tokenStart() >= 0 && issue.tokenEnd() > issue.tokenStart()) {
+                int tokenStart = Math.min(end, start + issue.tokenStart());
+                int tokenEnd = Math.min(end, start + issue.tokenEnd());
+                Object tokenTag = editor.getHighlighter().addHighlight(
+                    tokenStart,
+                    tokenEnd,
+                    new DefaultHighlighter.DefaultHighlightPainter(issueTokenHighlightColor(issue.severity()))
+                );
+                compileIssueHighlights.add(tokenTag);
+            }
+        } catch (BadLocationException ignored) {
+            // The document may change between compile and paint; the next compile will refresh the marker.
+        }
     }
 
     private void navigateFromLogClick(MouseEvent event) {
@@ -3612,12 +4675,12 @@ public final class MainWindow extends JFrame {
         Matcher pathMatcher = LOG_TEX_PATH_WITH_LINE.matcher(text);
         if (pathMatcher.find()) {
             Path source = resolveLogSourcePath(pathMatcher.group(1));
-            return new LogReference(source, parsePositiveInt(pathMatcher.group(2)));
+            return new LogReference(source, translateLogLine(parsePositiveInt(pathMatcher.group(2)), activeLogLineOffset));
         }
 
         Matcher lineMatcher = LOG_LINE_NUMBER.matcher(text);
         if (lineMatcher.find()) {
-            return new LogReference(compileSourceFile(), parsePositiveInt(lineMatcher.group(1)));
+            return new LogReference(compileSourceFile(), translateLogLine(parsePositiveInt(lineMatcher.group(1)), activeLogLineOffset));
         }
 
         return null;
@@ -3664,9 +4727,14 @@ public final class MainWindow extends JFrame {
     private void navigateToLogReference(LogReference reference) {
         if (reference.sourceFile() != null && Files.isRegularFile(reference.sourceFile()) && isTexFile(reference.sourceFile())) {
             if (!samePath(reference.sourceFile(), currentFile)) {
-                openLatexFile(reference.sourceFile(), true);
-                if (!samePath(reference.sourceFile(), currentFile)) {
-                    return;
+                preserveLogsDuringNavigation = true;
+                try {
+                    openLatexFile(reference.sourceFile(), true);
+                    if (!samePath(reference.sourceFile(), currentFile)) {
+                        return;
+                    }
+                } finally {
+                    preserveLogsDuringNavigation = false;
                 }
             }
         } else if (currentFile == null) {
@@ -3680,6 +4748,10 @@ public final class MainWindow extends JFrame {
         } catch (BadLocationException error) {
             setStatus("Could not jump to log line: " + error.getMessage());
         }
+    }
+
+    private void navigateToCompileIssue(CompileIssue issue) {
+        navigateToLogReference(new LogReference(issue.sourceFile(), issue.line()));
     }
 
     private void closeWindow() {
@@ -3696,14 +4768,53 @@ public final class MainWindow extends JFrame {
             return true;
         }
 
-        int choice = JOptionPane.showConfirmDialog(
+        Object[] options = {"Save", "Discard", "Cancel"};
+        int choice = JOptionPane.showOptionDialog(
             this,
-            "You have unsaved changes. Continue without saving?",
+            "You have unsaved changes. What should happen before continuing?",
             "Unsaved Changes",
-            JOptionPane.YES_NO_OPTION,
-            JOptionPane.WARNING_MESSAGE
+            JOptionPane.YES_NO_CANCEL_OPTION,
+            JOptionPane.WARNING_MESSAGE,
+            null,
+            options,
+            options[0]
         );
-        return choice == JOptionPane.YES_OPTION;
+        if (choice == 0) {
+            return saveAllUnsavedChanges();
+        }
+        return choice == 1;
+    }
+
+    private boolean saveAllUnsavedChanges() {
+        if (currentFile == null && dirty) {
+            saveFileAs();
+            if (dirty || currentFile == null) {
+                return false;
+            }
+        } else if (currentFile != null && dirty) {
+            saveFile();
+            if (dirty) {
+                return false;
+            }
+        }
+
+        rememberCurrentOpenTab();
+        for (OpenFileTab tab : openFileTabs.values()) {
+            if (!tab.dirty) {
+                continue;
+            }
+
+            try {
+                Files.writeString(tab.path, tab.text, StandardCharsets.UTF_8);
+                tab.dirty = false;
+            } catch (IOException error) {
+                showError("Could not save " + tab.path.getFileName(), error);
+                return false;
+            }
+        }
+        refreshEditorTabs();
+        updateTitle();
+        return true;
     }
 
     private boolean hasUnsavedChanges() {
@@ -3792,16 +4903,21 @@ public final class MainWindow extends JFrame {
 
         projectFilesVisible = visible;
         if (visible) {
-            setProjectFilesSlotWidth(Math.max(180, projectFilesDividerLocation));
             projectFilesCard.show(projectFilesSlot, PROJECT_FILES_EXPANDED_CARD);
+            projectFilesSlot.setVisible(true);
+            int restoredWidth = Math.max(180, projectFilesDividerLocation);
+            setProjectFilesSlotWidth(restoredWidth);
             projectWorkspaceSplit.setDividerSize(projectFilesDividerSize);
-            projectWorkspaceSplit.setDividerLocation(Math.max(180, projectFilesDividerLocation));
+            projectWorkspaceSplit.setDividerLocation(restoredWidth);
         } else {
-            projectFilesDividerLocation = Math.max(180, projectWorkspaceSplit.getDividerLocation());
-            setProjectFilesSlotWidth(COLLAPSED_PROJECT_FILES_WIDTH);
-            projectFilesCard.show(projectFilesSlot, PROJECT_FILES_COLLAPSED_CARD);
-            projectWorkspaceSplit.setDividerSize(COLLAPSED_PROJECT_FILES_DIVIDER_SIZE);
-            projectWorkspaceSplit.setDividerLocation(COLLAPSED_PROJECT_FILES_WIDTH);
+            int currentLocation = projectWorkspaceSplit.getDividerLocation();
+            if (currentLocation > 0) {
+                projectFilesDividerLocation = Math.max(180, currentLocation);
+            }
+            projectFilesSlot.setVisible(false);
+            setProjectFilesSlotWidth(0);
+            projectWorkspaceSplit.setDividerSize(0);
+            projectWorkspaceSplit.setDividerLocation(0);
         }
 
         if (toggleFilesButton != null) {
@@ -3819,7 +4935,8 @@ public final class MainWindow extends JFrame {
             return;
         }
 
-        projectFilesSlot.setMinimumSize(new Dimension(width, 120));
+        int minHeight = width == 0 ? 0 : 120;
+        projectFilesSlot.setMinimumSize(new Dimension(width, minHeight));
         projectFilesSlot.setPreferredSize(new Dimension(width, 100));
     }
 
@@ -3896,7 +5013,9 @@ public final class MainWindow extends JFrame {
         addGlobalShortcut("find", KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK), this::showFindDialog);
         addGlobalShortcut("replace", KeyStroke.getKeyStroke(KeyEvent.VK_H, InputEvent.CTRL_DOWN_MASK), this::showReplaceDialog);
         addGlobalShortcut("templates", KeyStroke.getKeyStroke(KeyEvent.VK_T, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK), this::showTemplatesDialog);
-        addGlobalShortcut("format-latex", KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK), this::formatLatex);
+        addGlobalShortcut("format-latex", KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK | InputEvent.ALT_DOWN_MASK), this::formatLatex);
+        addGlobalShortcut("find-project", KeyStroke.getKeyStroke(KeyEvent.VK_F, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK), this::showProjectSearchDialog);
+        addGlobalShortcut("show-in-pdf", KeyStroke.getKeyStroke(KeyEvent.VK_J, InputEvent.CTRL_DOWN_MASK | InputEvent.SHIFT_DOWN_MASK), this::showEditorLineInPdf);
     }
 
     private void addGlobalShortcut(String name, KeyStroke keyStroke, Runnable action) {
@@ -3978,12 +5097,13 @@ public final class MainWindow extends JFrame {
         int line = 1;
         int column = 1;
 
-        try {
-            int lineStart = javax.swing.text.Utilities.getRowStart(editor, caret);
-            line = editor.getDocument().getDefaultRootElement().getElementIndex(caret) + 1;
-            column = caret - Math.max(0, lineStart) + 1;
-        } catch (javax.swing.text.BadLocationException ignored) {
-            // Keep the previous coarse position if Swing cannot resolve the caret rectangle.
+        Element root = editor.getDocument().getDefaultRootElement();
+        int lineIndex = root.getElementIndex(caret);
+        Element sourceLine = root.getElement(lineIndex);
+        if (sourceLine != null) {
+            // Soft-wrapped rows still belong to the same source line.
+            line = lineIndex + 1;
+            column = caret - sourceLine.getStartOffset() + 1;
         }
 
         String fileName = openLocationDisplayName();
@@ -3999,6 +5119,66 @@ public final class MainWindow extends JFrame {
     private void showError(String title, Exception error) {
         JOptionPane.showMessageDialog(this, error.getMessage(), title, JOptionPane.ERROR_MESSAGE);
         appendLog(title + ": " + error.getMessage());
+    }
+
+    private final class CompileIssueRenderer extends DefaultListCellRenderer {
+        @Override
+        public Component getListCellRendererComponent(
+            JList<?> list,
+            Object value,
+            int index,
+            boolean isSelected,
+            boolean cellHasFocus
+        ) {
+            super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+            if (value instanceof CompileIssue issue) {
+                String line = issue.line() > 0 ? " L" + issue.line() : "";
+                setText(issue.severity().label + line + "  " + issue.message() + "  -  " + issue.hint());
+                setToolTipText(issue.hint());
+                if (!isSelected) {
+                    setForeground(issueColor(issue.severity()));
+                    setBackground(theme.panelBackground());
+                }
+            }
+            setBorder(BorderFactory.createEmptyBorder(3, 8, 3, 8));
+            return this;
+        }
+    }
+
+    private Color issueColor(IssueSeverity severity) {
+        return switch (severity) {
+            case ERROR -> errorColor();
+            case WARNING -> warningColor();
+            case NOTE -> noteColor();
+            case INFO -> theme.text();
+        };
+    }
+
+    private final class ProjectSearchResultRenderer extends DefaultListCellRenderer {
+        @Override
+        public Component getListCellRendererComponent(
+            JList<?> list,
+            Object value,
+            int index,
+            boolean isSelected,
+            boolean cellHasFocus
+        ) {
+            super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+            if (value instanceof ProjectSearchResult result) {
+                String label = result.file().getFileName()
+                    + ":" + result.line()
+                    + ":" + result.column()
+                    + "  " + result.preview();
+                setText(label);
+                setToolTipText(result.file().toString());
+                if (!isSelected) {
+                    setForeground(theme.text());
+                    setBackground(theme.panelBackground());
+                }
+            }
+            setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
+            return this;
+        }
     }
 
     private final class TemplateListRenderer extends DefaultListCellRenderer {

@@ -53,6 +53,10 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Scrollable PDF preview built on PDFBox. Pages render in the background so the
+ * editor stays responsive while zooming, scrolling, and reloading compiled PDFs.
+ */
 public final class PdfPreviewPanel extends JPanel {
     private static final float DISPLAY_DPI = 120f;
     private static final float MIN_RENDER_DPI = 240f;
@@ -90,6 +94,7 @@ public final class PdfPreviewPanel extends JPanel {
     private SourceNavigationHandler sourceNavigationHandler;
     private SwingWorker<RenderedDocument, Void> renderWorker;
     private SwingWorker<String, Void> textCopyWorker;
+    private PageMarker pendingJump;
     private boolean suppressNextSourceClick;
 
     public PdfPreviewPanel() {
@@ -169,11 +174,31 @@ public final class PdfPreviewPanel extends JPanel {
         renderRequestId++;
         renderDebounceTimer.stop();
         cancelRender();
+        pendingJump = null;
         currentPdf = null;
         pageCount = 0;
         documentCanvas.clear(message);
         statusLabel.setText("No PDF");
         updateControls();
+    }
+
+    public void jumpToPosition(int pageNumber, double normalizedX, double normalizedY) {
+        if (scrollPane == null || pageCount == 0) {
+            pendingJump = new PageMarker(Math.max(0, pageNumber - 1), normalizedX, normalizedY);
+            statusLabel.setText("Waiting for PDF preview...");
+            return;
+        }
+
+        int pageIndex = Math.max(0, Math.min(pageNumber - 1, pageCount - 1));
+        pendingJump = null;
+        Point pagePoint = documentCanvas.pagePoint(pageIndex, normalizedX, normalizedY);
+        JViewport viewport = scrollPane.getViewport();
+        Dimension viewSize = documentCanvas.getPreferredSize();
+        int x = Math.max(0, Math.min(pagePoint.x - viewport.getWidth() / 2, Math.max(0, viewSize.width - viewport.getWidth())));
+        int y = Math.max(0, Math.min(pagePoint.y - viewport.getHeight() / 2, Math.max(0, viewSize.height - viewport.getHeight())));
+        viewport.setViewPosition(new Point(x, y));
+        documentCanvas.setSourceMarker(pageIndex, normalizedX, normalizedY);
+        statusLabel.setText("Source line shown on page " + pageNumber);
     }
 
     private JPanel createToolbar() {
@@ -638,7 +663,8 @@ public final class PdfPreviewPanel extends JPanel {
         float requestedZoom = zoom;
         int requestId = ++renderRequestId;
 
-        // Render all pages so the preview behaves like one connected, scrollable document.
+        // Render all pages at the requested zoom so the preview behaves like one connected,
+        // scrollable document instead of a one-page-at-a-time viewer.
         renderWorker = new SwingWorker<>() {
             @Override
             protected RenderedDocument doInBackground() throws Exception {
@@ -655,6 +681,11 @@ public final class PdfPreviewPanel extends JPanel {
                     RenderedDocument document = get();
                     pageCount = document.pageCount();
                     documentCanvas.setDocument(document.pages(), zoom, document.renderDpi());
+                    if (pendingJump != null) {
+                        PageMarker jump = pendingJump;
+                        pendingJump = null;
+                        jumpToPosition(jump.pageIndex() + 1, jump.normalizedX(), jump.normalizedY());
+                    }
                 } catch (Exception error) {
                     documentCanvas.clear("Could not render PDF: " + error.getMessage());
                     pageCount = 0;
@@ -814,6 +845,9 @@ public final class PdfPreviewPanel extends JPanel {
     private record PageHit(int pageIndex, double normalizedX, double normalizedY) {
     }
 
+    private record PageMarker(int pageIndex, double normalizedX, double normalizedY) {
+    }
+
     private record PageSelection(
         int pageIndex,
         double normalizedX,
@@ -847,6 +881,7 @@ public final class PdfPreviewPanel extends JPanel {
         private String message = "Compile a document to preview the PDF here.";
         private Point selectionStart;
         private Point selectionEnd;
+        private PageMarker sourceMarker;
         private boolean selecting;
 
         private DocumentCanvas() {
@@ -868,6 +903,7 @@ public final class PdfPreviewPanel extends JPanel {
             this.zoom = zoom;
             this.renderDpi = renderDpi;
             this.message = null;
+            this.sourceMarker = null;
             clearSelection();
             revalidate();
             repaint();
@@ -905,8 +941,18 @@ public final class PdfPreviewPanel extends JPanel {
         private void clear(String message) {
             this.pages = List.of();
             this.message = message;
+            this.sourceMarker = null;
             clearSelection();
             revalidate();
+            repaint();
+        }
+
+        private void setSourceMarker(int pageIndex, double normalizedX, double normalizedY) {
+            sourceMarker = new PageMarker(
+                Math.max(0, Math.min(pageIndex, pages.size() - 1)),
+                Math.max(0d, Math.min(1d, normalizedX)),
+                Math.max(0d, Math.min(1d, normalizedY))
+            );
             repaint();
         }
 
@@ -1034,13 +1080,15 @@ public final class PdfPreviewPanel extends JPanel {
                 }
 
                 int y = PAGE_MARGIN;
-                for (BufferedImage pageImage : pages) {
+                for (int pageIndex = 0; pageIndex < pages.size(); pageIndex++) {
+                    BufferedImage pageImage = pages.get(pageIndex);
                     Dimension page = displaySize(pageImage);
                     int x = Math.max(PAGE_MARGIN, (getWidth() - page.width) / 2);
 
                     if (y + page.height >= clip.y && y <= clip.y + clip.height) {
                         paintPage(graphics2D, pageImage, x, y, page);
                         paintSelection(graphics2D, new Rectangle(x, y, page.width, page.height));
+                        paintSourceMarker(graphics2D, pageIndex, new Rectangle(x, y, page.width, page.height));
                     }
 
                     y += page.height + PAGE_GAP;
@@ -1073,6 +1121,22 @@ public final class PdfPreviewPanel extends JPanel {
             graphics.fill(selectedArea);
             graphics.setColor(SELECTION_BORDER);
             graphics.draw(selectedArea);
+        }
+
+        private void paintSourceMarker(Graphics2D graphics, int pageIndex, Rectangle pageBounds) {
+            if (sourceMarker == null || sourceMarker.pageIndex() != pageIndex) {
+                return;
+            }
+
+            // The marker uses normalized page coordinates from SyncTeX so it stays correct
+            // after zoom changes or a high-DPI re-render.
+            int markerX = pageBounds.x + (int) Math.round(sourceMarker.normalizedX() * pageBounds.width);
+            int markerY = pageBounds.y + (int) Math.round(sourceMarker.normalizedY() * pageBounds.height);
+            int radius = 9;
+            graphics.setColor(new Color(255, 123, 114, 120));
+            graphics.fillOval(markerX - radius, markerY - radius, radius * 2, radius * 2);
+            graphics.setColor(new Color(207, 34, 46, 210));
+            graphics.drawOval(markerX - radius, markerY - radius, radius * 2, radius * 2);
         }
 
         private int pageTop(int pageIndex) {
@@ -1120,6 +1184,21 @@ public final class PdfPreviewPanel extends JPanel {
             }
 
             return null;
+        }
+
+        private Point pagePoint(int pageIndex, double normalizedX, double normalizedY) {
+            if (pages.isEmpty()) {
+                return new Point(0, 0);
+            }
+
+            int safePage = Math.max(0, Math.min(pageIndex, pages.size() - 1));
+            Dimension page = displaySize(pages.get(safePage));
+            int x = Math.max(PAGE_MARGIN, (getWidth() - page.width) / 2);
+            int y = pageTop(safePage);
+            return new Point(
+                x + (int) Math.round(Math.max(0d, Math.min(1d, normalizedX)) * page.width),
+                y + (int) Math.round(Math.max(0d, Math.min(1d, normalizedY)) * page.height)
+            );
         }
 
         private Dimension displaySize(BufferedImage pageImage) {
