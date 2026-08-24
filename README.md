@@ -26,14 +26,18 @@ The app is designed so end users install only the app. It can use bundled tools 
 - Create, rename, move, copy, and delete project files from the file panel
 - Select a main `.tex` file for multi-file projects
 - Find and replace source text with `Ctrl+F` and `Ctrl+H`
+- Search across the opened project with `Ctrl+Shift+F`
 - Click LaTeX log line references to jump back to the editor
+- Jump from the current source line to the matching PDF page with `Ctrl+Shift+J`
+- Show grouped compiler issues with error/warning colors, line jumps, hints, and source highlighting
 - Auto-refresh the file panel when project files change outside the app
 - Switch between system, light, and dark mode from the View menu
+- Save crash logs locally and open a prefilled GitHub bug report from the Tools menu
 - Show or hide export logs
 - Export to Word `.docx` with Pandoc
 - Shows export logs inside the app
 - Prompts before downloading missing command-line tools
-- Shows Java, Tectonic, Pandoc, project, and compile settings inside the app
+- Shows Java, Tectonic, Pandoc, project, output folder, and compile settings inside the app
 - Opens generated exports with the system viewer
 
 ## Tool Strategy
@@ -87,6 +91,16 @@ Or compile a jar with:
 .\scripts\build-jar.ps1
 ```
 
+## Crash Logs and Bug Reports
+
+Unexpected app crashes are written to the app data logs folder:
+
+```text
+%APPDATA%\LaTeX Compiler\logs\
+```
+
+Use `Tools > Report Bug...` to open a prefilled GitHub issue. The report includes basic app/system context, and you can choose whether to include the latest crash log because it may contain local file paths.
+
 ## Build
 
 ```powershell
@@ -95,13 +109,19 @@ gradle clean build
 
 ## Create a Windows Installer
 
-Install JDK 21, then run:
+Install JDK 21, close any running copy of LaTeX Compiler, then run:
 
 ```powershell
 .\scripts\package-windows.ps1
 ```
 
 The installer output is written to `installer/`.
+
+By default the script creates a per-user installer to avoid requiring admin rights for normal installs. Use `-MachineInstall` if you intentionally want a machine-wide installer.
+
+The packaging script stages every runtime jar in `build/jpackage-input` before calling `jpackage`. This keeps dependency jars such as PDFBox beside the app jar in the installed application.
+
+Unsigned local installers may still be blocked or warned by Windows Smart App Control. That is expected for personal builds. A public release should eventually be code-signed to build Windows reputation and reduce those warnings.
 
 ## GitHub Releases
 

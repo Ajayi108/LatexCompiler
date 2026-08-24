@@ -17,7 +17,6 @@ if (-not (Get-Command jar -ErrorAction SilentlyContinue)) {
 
 $buildRoot = "build/manual"
 $classesDir = "$buildRoot/classes"
-$depsDir = "$buildRoot/deps"
 $libsDir = "$buildRoot/libs"
 $manifestPath = "$buildRoot/MANIFEST.MF"
 
@@ -25,14 +24,9 @@ if (Test-Path $buildRoot) {
     Remove-Item -Recurse -Force $buildRoot
 }
 
-New-Item -ItemType Directory -Force -Path $classesDir, $depsDir, $libsDir | Out-Null
+New-Item -ItemType Directory -Force -Path $classesDir, $libsDir | Out-Null
 
-$sourceDependencyJars = Get-ChildItem -Path "libs" -Filter "*.jar" -ErrorAction SilentlyContinue
-foreach ($jar in $sourceDependencyJars) {
-    Copy-Item -Force $jar.FullName $depsDir
-}
-
-$dependencyJars = Get-ChildItem -Path $depsDir -Filter "*.jar" -ErrorAction SilentlyContinue
+$dependencyJars = Get-ChildItem -Path "libs" -Filter "*.jar" -ErrorAction SilentlyContinue
 $dependencyClassPath = ($dependencyJars | ForEach-Object { $_.FullName }) -join [System.IO.Path]::PathSeparator
 
 $sources = Get-ChildItem -Path "src/main/java" -Recurse -Filter "*.java" | ForEach-Object { $_.FullName }
@@ -40,9 +34,21 @@ if (-not $sources) {
     throw "No Java source files found."
 }
 
-javac -encoding UTF-8 -d $classesDir $sources
+$javacArgs = @("-J-Dsun.zip.disableMemoryMapping=true", "-encoding", "UTF-8")
+if ($dependencyClassPath) {
+    $javacArgs += @("-classpath", $dependencyClassPath)
+}
+$javacArgs += @("-d", $classesDir)
+$javacArgs += $sources
+
+javac @javacArgs
 if ($LASTEXITCODE -ne 0) {
     throw "javac failed with exit code $LASTEXITCODE."
+}
+
+$resourcesDir = "src/main/resources"
+if (Test-Path $resourcesDir) {
+    Copy-Item -Recurse -Force "$resourcesDir/*" $classesDir
 }
 
 $manifest = @(
