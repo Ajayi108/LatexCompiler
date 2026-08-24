@@ -6,7 +6,9 @@ The app is designed so end users install only the app. It can use bundled tools 
 
 ## Preview
 
-![LaTeX Compiler editor with project files, source code, outline, logs, and PDF preview](docs/images/app-preview.png)
+![LaTeX Compiler editor showing a complex LaTeX document and the first PDF preview page](docs/images/app-preview.png)
+
+![LaTeX Compiler editor showing the second PDF preview page and compile logs](docs/images/app-preview-page-2.png)
 
 ## Current Features
 
